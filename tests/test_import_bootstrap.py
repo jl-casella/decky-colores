@@ -28,9 +28,10 @@ def test_plugin_prefers_bundled_modules_over_system_name_collision(tmp_path):
         import main
 
         bundled = pathlib.Path({str(ROOT / "py_modules")!r}).resolve()
-        loaded = pathlib.Path(main.report_collector.__file__).resolve()
+        import colores_report.recorder as recorder
+        loaded = pathlib.Path(recorder.__file__).resolve()
         assert bundled in loaded.parents, loaded
-        assert main.report_collector.__name__ == "colores_report.collector"
+        assert recorder.__name__ == "colores_report.recorder"
         """
     )
     environment = os.environ.copy()

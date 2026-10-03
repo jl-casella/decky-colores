@@ -136,15 +136,6 @@ def test_game_profile_never_persists_startup(profile_plugin):
     assert calls == []
 
 
-def test_report_contains_only_profile_aggregate(profile_plugin):
-    profile_plugin._profiles.patch("game", "private-app-key", {"brightness": 20})
-
-    serialized = json.dumps(profile_plugin._report_stores())
-
-    assert "private-app-key" not in serialized
-    assert '"profiles_configured": 1' in serialized
-
-
 def test_separate_power_led_state_persists_and_preserves_other_state(
     profile_plugin, tmp_path
 ):

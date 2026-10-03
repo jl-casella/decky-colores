@@ -282,111 +282,73 @@ def _hhd_plugin(
     return plugin, saved
 
 
-def test_submit_report_forwards_feature_kind(main_module, monkeypatch):
+def test_toggle_diagnostics_capture_persists_enabled_state(main_module, tmp_path):
     plugin = main_module.Plugin()
     plugin._ready = True
-    plugin._redact_ids = lambda: ("/home/deck", "deck")
-    captured = {}
+    plugin._settings = {"diagnostics_capture_enabled": False, "diagnostics_capture_since": None}
+    plugin._persist_settings = lambda: None
+    plugin._diagnostics_directory = lambda: str(tmp_path)
+    plugin._run_capture = lambda cmd: ""
 
-    async def build_bundle(categories, text, home, hostname, kind):
-        captured.update(
-            categories=categories,
-            text=text,
-            home=home,
-            hostname=hostname,
-            kind=kind,
-        )
-        return {"app": "colores", "kind": kind, "logs": ["context"]}
+    state = asyncio.run(plugin.set_diagnostics_capture(True))
 
-    plugin._build_report_bundle = build_bundle
-    monkeypatch.setattr(
-        main_module.report_client,
-        "submit",
-        lambda *_args, **_kwargs: {"ok": True, "code": "COL-TEST"},
-    )
-
-    result = asyncio.run(
-        plugin.submit_report(["effects"], "Please add an effect", "feature")
-    )
-
-    assert result == {"ok": True, "code": "COL-TEST", "issue_url": None}
-    assert captured == {
-        "categories": ["effects"],
-        "text": "Please add an effect",
-        "home": "/home/deck",
-        "hostname": "deck",
-        "kind": "feature",
-    }
+    assert state["enabled"] is True
+    assert state["since"] is not None
+    assert state["has_logs"] is True
+    assert state["active_file"] is not None
+    assert "diagnostics capture started" in open(state["active_file"], encoding="utf-8").read()
 
 
-def test_report_runtime_diagnostics_exposes_lifecycle_and_rgb_ownership(main_module):
-    plugin = _plugin(main_module, "ambient", hhd_takeover=True)
-    plugin._suspend_monitor = FakeSuspendMonitor()
-    plugin._suspend_prepared = True
-    plugin._settings.update(force_control=True, hhd_rgb_restore=True)
-    plugin._hhd_rgb_status = "disabled"
-
-    runtime = plugin._report_runtime_diagnostics()
-
-    assert runtime == {
-        "suspend": {
-            "running": True,
-            "connected": True,
-            "inhibitor_armed": True,
-            "sleeping": False,
-            "last_error": None,
-            "prepared": True,
-        },
-        "render": {
-            "engine_running": False,
-            "ambilight_running": False,
-            "ambilight_status": "idle",
-            "audio_status": "idle",
-        },
-        "hhd_rgb": {
-            "takeover_supported": True,
-            "force_control": True,
-            "status": "disabled",
-            "restore_pending": True,
-        },
-    }
-
-
-def test_report_bundle_wires_error_summary_and_runtime_diagnostics(
+def test_delete_diagnostics_logs_stops_capture_and_removes_directory(
     main_module, monkeypatch, tmp_path
 ):
-    plugin = _plugin(main_module, "solid", hhd_takeover=True)
-    plugin._suspend_monitor = FakeSuspendMonitor()
-    plugin._device = {"name": "ROG Ally", "board": "RC71L", "product": "RC71L"}
-    log = tmp_path / "colores.log"
-    log.write_text("[ERROR] failed at /home/deck/private\nordinary frame\n")
-    monkeypatch.setattr(
-        main_module.decky,
-        "DECKY_PLUGIN_LOG_DIR",
-        str(tmp_path),
-        raising=False,
-    )
-    plugin._report_environment = lambda: {"os": "SteamOS"}
-    plugin._report_stores = lambda: {}
-    plugin._run_capture = lambda command: None
+    home = tmp_path / "home"
+    logs = home / "Documents" / "colores-logs"
+    logs.mkdir(parents=True)
+    (logs / "colores-session-test.jsonl").write_text("diagnostic data")
+    (logs / ".colores-capture-state.json").write_text("{}")
+    monkeypatch.setattr(main_module.decky, "DECKY_USER_HOME", str(home), raising=False)
+    plugin = main_module.Plugin()
+    plugin._ready = True
+    plugin._settings = {"diagnostics_capture_enabled": True, "diagnostics_capture_since": 123}
+    plugin._persist_settings = lambda: None
+    stopped = []
 
-    async def get_state():
-        return {"device": plugin._device, "capabilities": plugin._capabilities}
+    async def stop_recorder():
+        stopped.append(True)
+        plugin._diagnostics_task = None
+        plugin._diagnostics_recorder = None
 
-    plugin.get_state = get_state
+    plugin._stop_diagnostics_recorder = stop_recorder
 
-    bundle = asyncio.run(
-        plugin._build_report_bundle(
-            ["color"], "does not light", "/home/deck", "handheld", "bug"
-        )
-    )
+    state = asyncio.run(plugin.delete_diagnostics_logs())
 
-    assert bundle["errors"] == [{
-        "name": "colores.log",
-        "text": "[ERROR] failed at ~/private",
-    }]
-    assert bundle["runtime"]["suspend"]["connected"] is True
-    assert bundle["capabilities"]["hhd_rgb_takeover"] is True
+    assert not logs.exists()
+    assert stopped == [True]
+    assert plugin._settings["diagnostics_capture_enabled"] is False
+    assert plugin._settings["diagnostics_capture_since"] is None
+    assert state["enabled"] is False
+    assert state["has_logs"] is False
+    assert state["error"] is None
+
+
+def test_delete_diagnostics_logs_refuses_unexpected_path(main_module, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    unexpected = tmp_path / "other" / "colores-logs"
+    unexpected.mkdir(parents=True)
+    (unexpected / "keep.txt").write_text("keep")
+    monkeypatch.setattr(main_module.decky, "DECKY_USER_HOME", str(home), raising=False)
+    plugin = main_module.Plugin()
+    plugin._ready = True
+    plugin._settings = {"diagnostics_capture_enabled": False, "diagnostics_capture_since": None}
+    plugin._persist_settings = lambda: None
+    plugin._diagnostics_directory = lambda: str(unexpected)
+    plugin._stop_diagnostics_recorder = lambda: asyncio.sleep(0)
+
+    state = asyncio.run(plugin.delete_diagnostics_logs())
+
+    assert (unexpected / "keep.txt").exists()
+    assert state["error"] == "delete_failed"
 
 
 @pytest.mark.parametrize(

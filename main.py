@@ -1,7 +1,9 @@
 import asyncio
+import glob
 import json
 import os
 import pwd
+import shutil
 import time
 
 import decky
@@ -25,13 +27,7 @@ from saved_gradients import upsert_gradient, remove_gradient
 from hhd_rgb_control import HhdRgbControl
 from suspend_monitor import SuspendMonitor
 import self_updater
-from colores_report import collector as report_collector
-from colores_report import client as report_client
-
-_REPORT_APP = "colores"
-_REPORT_SERVICE_URL = os.environ.get(
-    "COLORES_REPORT_URL", "https://bug-collector-khaki.vercel.app/api/report"
-)
+from colores_report.recorder import LocalDiagnosticsRecorder
 
 SENSOR_BAND_DEFAULTS = {
     "battery": BATTERY_BANDS,
@@ -62,6 +58,8 @@ DEFAULTS = {
     "sensor_bands": dict(SENSOR_BAND_DEFAULTS),
     "remember_startup": True,
     "startup_factory": None,
+    "diagnostics_capture_enabled": False,
+    "diagnostics_capture_since": None,
 }
 
 PROFILE_KEYS = (
@@ -212,6 +210,8 @@ class Plugin:
             logger=decky.logger,
         )
         self._hhd_rgb_lock = asyncio.Lock()
+        self._diagnostics_task = None
+        self._diagnostics_recorder = None
         self._capture_transition_generation = 0
         self._capture_transition_task = None
         self._capture_owner = None
@@ -366,133 +366,153 @@ class Plugin:
     async def restart_loader(self) -> None:
         self_updater.restart_loader()
 
-    async def submit_report(
-        self, categories=None, text: str = "", kind: str = "bug"
-    ) -> dict:
+    async def get_diagnostics_capture(self) -> dict:
         self._init()
-        home, hostname = self._redact_ids()
-        report_kind = report_collector.normalize_report_kind(kind)
-        try:
-            bundle = await self._build_report_bundle(
-                categories, text, home, hostname, report_kind
-            )
-        except Exception as e:  # noqa: BLE001
-            decky.logger.error("Colores: report bundle failed: %s", e)
-            bundle = report_collector.build_bundle(
-                app=_REPORT_APP, categories=categories, text=text,
-                environment={}, capabilities={}, state={}, stores={}, logs=[],
-                kind=report_kind,
-                home=home, hostname=hostname,
-            )
-            bundle["error"] = "bundle_incomplete"
-        res = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: report_client.submit(_REPORT_SERVICE_URL, bundle)
-        )
-        if res.get("ok"):
-            decky.logger.info("Colores: report sent: %s", res.get("code"))
-            return {"ok": True, "code": res["code"], "issue_url": res.get("issue_url")}
-        path = report_client.save_local(
-            getattr(decky, "DECKY_PLUGIN_LOG_DIR", "."), bundle
-        )
-        decky.logger.warning(
-            "Colores: report send failed (%s); saved to %s", res.get("error"), path
-        )
-        return {"ok": False, "error": res.get("error", "unknown"), "saved_path": path}
-
-    def _redact_ids(self):
-        home = getattr(decky, "DECKY_USER_HOME", None) or os.path.expanduser("~")
-        try:
-            import socket
-
-            hostname = socket.gethostname()
-        except Exception:  # noqa: BLE001
-            hostname = None
-        return home, hostname
-
-    async def _build_report_bundle(
-        self, categories, text, home, hostname, kind: str = "bug"
-    ) -> dict:
-        loop = asyncio.get_running_loop()
-        try:
-            state = await self.get_state()
-        except Exception:  # noqa: BLE001
-            state = {}
-        capabilities = report_collector.capabilities_from(
-            state,
-            driver=type(self._controller).__name__,
-            route=getattr(self._controller, "route", None),
-            led_path=getattr(self._controller, "led_path", None),
-            last_error=getattr(self._controller, "last_error", None),
-        )
-        runtime = self._report_runtime_diagnostics()
-
-        def _assemble() -> dict:
-            logs = report_collector.tail_logs(
-                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""), home=home, hostname=hostname
-            )
-            errors = report_collector.tail_error_logs(
-                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""), home=home, hostname=hostname
-            )
-            snapshot = report_collector.sysfs_snapshot(home=home, hostname=hostname)
-            kernel = report_collector.kernel_logs(
-                self._run_capture,
-                extra=report_collector.rgb_conflict_cmds(
-                    bool(capabilities.get("conflicts_with_system_rgb"))
-                ),
-                home=home,
-                hostname=hostname,
-            )
-            return report_collector.build_bundle(
-                app=_REPORT_APP,
-                kind=kind,
-                categories=categories,
-                text=text,
-                environment=self._report_environment(),
-                capabilities=capabilities,
-                state=state,
-                stores=self._report_stores(),
-                logs=logs,
-                errors=errors,
-                runtime=runtime,
-                kernel=kernel,
-                sysfs=snapshot,
-                home=home,
-                hostname=hostname,
-            )
-
-        return await loop.run_in_executor(None, _assemble)
-
-    def _report_runtime_diagnostics(self) -> dict:
-        def running(component):
-            probe = getattr(component, "running", None)
+        enabled = bool(self._settings.get("diagnostics_capture_enabled", False))
+        error = None
+        if enabled:
             try:
-                return bool(probe() if callable(probe) else probe)
-            except Exception:  # noqa: BLE001
-                return None
-
-        monitor = getattr(self, "_suspend_monitor", None)
-        try:
-            suspend = monitor.diagnostics() if monitor else {}
-        except Exception:  # noqa: BLE001
-            suspend = {}
-        suspend["prepared"] = bool(getattr(self, "_suspend_prepared", False))
-        settings = getattr(self, "_settings", {})
-        capabilities = getattr(self, "_capabilities", {})
+                self._start_diagnostics_recorder()
+            except Exception as start_error:  # noqa: BLE001
+                decky.logger.error("Colores: diagnostics recorder resume failed: %s", start_error)
+                error = "capture_start_failed"
+        files = self._diagnostics_files()
         return {
-            "suspend": suspend,
-            "render": {
-                "engine_running": running(getattr(self, "_engine", None)),
-                "ambilight_running": running(getattr(self, "_ambilight", None)),
-                "ambilight_status": getattr(getattr(self, "_ambilight", None), "status", None),
-                "audio_status": getattr(getattr(self, "_audio", None), "status", None),
-            },
-            "hhd_rgb": {
-                "takeover_supported": bool(capabilities.get("hhdRgbTakeover")),
-                "force_control": bool(settings.get("force_control")),
-                "status": getattr(self, "_hhd_rgb_status", None),
-                "restore_pending": settings.get("hhd_rgb_restore") is True,
-            },
+            "enabled": enabled,
+            "since": self._settings.get("diagnostics_capture_since"),
+            "directory": self._diagnostics_directory(),
+            "active_file": self._diagnostics_recorder.current_file()
+            if enabled and self._diagnostics_recorder
+            else None,
+            "has_logs": bool(files),
+            "error": error,
         }
+
+    async def set_diagnostics_capture(self, enabled: bool) -> dict:
+        self._init()
+        enabled = bool(enabled)
+        current = bool(self._settings.get("diagnostics_capture_enabled", False))
+        if enabled == current:
+            if enabled:
+                try:
+                    self._start_diagnostics_recorder()
+                except Exception as error:  # noqa: BLE001
+                    decky.logger.error("Colores: diagnostics recorder start failed: %s", error)
+                    result = await self.get_diagnostics_capture()
+                    result["error"] = "capture_start_failed"
+                    return result
+            return await self.get_diagnostics_capture()
+        if enabled:
+            started = time.time()
+            home = self._diagnostics_home()
+            recorder = LocalDiagnosticsRecorder(
+                self._diagnostics_directory(), home, started, self._run_capture,
+                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""),
+            )
+            try:
+                recorder.prepare()
+            except Exception as error:  # noqa: BLE001
+                decky.logger.error("Colores: diagnostics directory unavailable: %s", error)
+                result = await self.get_diagnostics_capture()
+                result["error"] = "capture_start_failed"
+                return result
+            self._diagnostics_recorder = recorder
+        self._settings["diagnostics_capture_enabled"] = enabled
+        self._settings["diagnostics_capture_since"] = started if enabled else None
+        try:
+            self._persist_settings()
+        except Exception as error:  # noqa: BLE001
+            if enabled:
+                await self._stop_diagnostics_recorder()
+            self._settings["diagnostics_capture_enabled"] = current
+            self._settings["diagnostics_capture_since"] = None
+            decky.logger.error("Colores: diagnostics capture setting save failed: %s", error)
+            result = await self.get_diagnostics_capture()
+            result["error"] = "capture_start_failed"
+            return result
+        decky.logger.info("Colores: local diagnostics capture %s", "enabled" if enabled else "disabled")
+        if enabled:
+            self._diagnostics_task = asyncio.create_task(self._diagnostics_recorder.run())
+        else:
+            await self._stop_diagnostics_recorder()
+        return await self.get_diagnostics_capture()
+
+    async def delete_diagnostics_logs(self) -> dict:
+        self._init()
+        previous_enabled = bool(self._settings.get("diagnostics_capture_enabled", False))
+        previous_since = self._settings.get("diagnostics_capture_since")
+        self._settings["diagnostics_capture_enabled"] = False
+        self._settings["diagnostics_capture_since"] = None
+        try:
+            self._persist_settings()
+        except Exception as error:  # noqa: BLE001
+            self._settings["diagnostics_capture_enabled"] = previous_enabled
+            self._settings["diagnostics_capture_since"] = previous_since
+            decky.logger.error("Colores: diagnostics setting reset failed before deleting logs: %s", error)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+
+        await self._stop_diagnostics_recorder()
+        directory = os.path.abspath(self._diagnostics_directory())
+        home = self._diagnostics_home()
+        expected_parent = os.path.abspath(os.path.join(home, "Documents"))
+        if os.path.dirname(directory) != expected_parent or os.path.basename(directory) != "colores-logs":
+            decky.logger.error("Colores: refusing to delete unexpected diagnostics path: %s", directory)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: os.unlink(directory)
+                if os.path.islink(directory)
+                else shutil.rmtree(directory, ignore_errors=False),
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            decky.logger.error("Colores: diagnostics log deletion failed: %s", error)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+        decky.logger.info("Colores: local diagnostics logs deleted")
+        return await self.get_diagnostics_capture()
+
+    def _diagnostics_files(self) -> list[str]:
+        return sorted(glob.glob(os.path.join(
+            self._diagnostics_directory(), "colores-session-*.jsonl"
+        )))
+
+    def _start_diagnostics_recorder(self) -> None:
+        task = getattr(self, "_diagnostics_task", None)
+        if task is not None and not task.done():
+            return
+        home = self._diagnostics_home()
+        since = self._settings.get("diagnostics_capture_since") or time.time()
+        recorder = LocalDiagnosticsRecorder(
+            self._diagnostics_directory(), home, since, self._run_capture,
+            getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""),
+        )
+        recorder.prepare()
+        self._diagnostics_recorder = recorder
+        self._diagnostics_task = asyncio.create_task(recorder.run())
+
+    async def _stop_diagnostics_recorder(self) -> None:
+        task = getattr(self, "_diagnostics_task", None)
+        self._diagnostics_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._diagnostics_recorder = None
+
+    def _diagnostics_directory(self) -> str:
+        return os.path.join(self._diagnostics_home(), "Documents", "colores-logs")
+
+    @staticmethod
+    def _diagnostics_home() -> str:
+        return getattr(decky, "DECKY_USER_HOME", None) or os.path.expanduser("~")
 
     def _run_capture(self, cmd) -> str | None:
         try:
@@ -507,60 +527,6 @@ class Plugin:
             return r.stdout or ""
         except Exception:  # noqa: BLE001
             return None
-
-    def _report_environment(self) -> dict:
-        def _dmi(name):
-            try:
-                with open(f"/sys/class/dmi/id/{name}") as f:
-                    return f.read().strip()
-            except OSError:
-                return None
-
-        os_name = None
-        try:
-            rel = {}
-            with open("/etc/os-release") as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.rstrip().split("=", 1)
-                        rel[k] = v.strip('"')
-            os_name = rel.get("PRETTY_NAME") or rel.get("NAME")
-        except Exception:  # noqa: BLE001
-            pass
-        kernel = None
-        try:
-            u = os.uname()
-            kernel = f"{u.sysname} {u.release}"
-        except Exception:  # noqa: BLE001
-            pass
-        dev = getattr(self, "_device", {}) or {}
-        return {
-            "plugin_version": read_version(),
-            "decky_version": getattr(decky, "DECKY_VERSION", None),
-            "device_key": dev.get("name"),
-            "product_name": dev.get("product") or _dmi("product_name"),
-            "product_family": _dmi("product_family"),
-            "board_name": dev.get("board") or _dmi("board_name"),
-            "os": os_name,
-            "kernel": kernel,
-        }
-
-    def _report_stores(self) -> dict:
-        base = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", "")
-        try:
-            with open(os.path.join(base, "state.json")) as f:
-                settings = json.load(f)
-        except Exception:  # noqa: BLE001
-            settings = getattr(self, "_settings", {})
-        stores = {"settings": settings}
-        profiles = getattr(self, "_profiles", None)
-        if profiles is not None:
-            stores["profiles"] = {
-                "profiles_configured": profiles.configured_count(),
-                "watcher_state": "game" if self._current_app_key else "global",
-                "fallback_reason": None,
-            }
-        return stores
 
     def _serialized_saved(self) -> list:
         return [_saved(g) for g in self._settings["saved_gradients"]]
@@ -1373,6 +1339,11 @@ class Plugin:
         )
         self._suspend_monitor.start()
         self._apply()
+        if self._settings.get("diagnostics_capture_enabled", False):
+            try:
+                self._start_diagnostics_recorder()
+            except OSError as error:
+                decky.logger.error("Colores: diagnostics recorder resume failed: %s", error)
         self._reassert_task = asyncio.create_task(self._acquire_and_reassert())
         self._charger_task = asyncio.create_task(self._charger_watch())
         self._resume_task = asyncio.create_task(self._resume_watch())
@@ -1484,6 +1455,7 @@ class Plugin:
             "_resume_task",
             "_force_control_task",
             "_startup_task",
+            "_diagnostics_task",
         ):
             task = getattr(self, attr, None)
             if task:
@@ -1491,6 +1463,8 @@ class Plugin:
                 tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._diagnostics_task = None
+        self._diagnostics_recorder = None
 
     async def _unload(self):
         await self._stop_background_tasks()

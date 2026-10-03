@@ -407,8 +407,32 @@ class Runtime:
             return {"ok": False, "needs_restart": False, "message": "Updates are disabled in the emulator"}
         if name == "restart_loader":
             return None
-        if name == "submit_report":
-            return {"ok": False, "error": "Reports are disabled in the emulator"}
+        if name == "get_diagnostics_capture":
+            return {
+                "enabled": False,
+                "since": None,
+                "directory": "~/Documents/colores-logs",
+                "active_file": None,
+                "has_logs": False,
+            }
+        if name == "set_diagnostics_capture":
+            return {
+                "enabled": False,
+                "since": None,
+                "directory": "~/Documents/colores-logs",
+                "active_file": None,
+                "has_logs": False,
+                "error": "capture_disabled",
+            }
+        if name == "delete_diagnostics_logs":
+            return {
+                "enabled": False,
+                "since": None,
+                "directory": "~/Documents/colores-logs",
+                "active_file": None,
+                "has_logs": False,
+                "error": "capture_disabled",
+            }
         method = getattr(self.plugin, name, None)
         if method is None or name.startswith("_"):
             raise AttributeError(f"unknown plugin call: {name}")

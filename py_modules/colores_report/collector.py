@@ -5,10 +5,6 @@ import json
 import os
 import re
 
-SCHEMA = 2
-
-_MAX_TEXT = 4000
-
 _SCRUB_KEY = re.compile(r"serial|uuid|\bmac\b|mac_?addr|hostname|host_name", re.I)
 _HOME_PATH = re.compile(r"/home/[^/\s:\"']+")
 _MAC = re.compile(r"\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b")
@@ -26,10 +22,6 @@ _ERROR_LINE = re.compile(
     r"\b(?:error|exception|traceback|failed|failure|warning|warn|errno|\w+error)\b",
     re.I,
 )
-
-
-def normalize_report_kind(kind) -> str:
-    return "feature" if kind == "feature" else "bug"
 
 
 def redact_text(s, *, home: str | None = None, hostname: str | None = None):
@@ -99,6 +91,7 @@ def tail_logs(
     *,
     max_files: int = 3,
     max_bytes: int = 200_000,
+    since: float | None = None,
     home: str | None = None,
     hostname: str | None = None,
 ) -> list[dict]:
@@ -108,6 +101,8 @@ def tail_logs(
             key=os.path.getmtime,
             reverse=True,
         )
+        if since is not None:
+            files = [path for path in files if os.path.getmtime(path) >= since]
     except Exception:  # noqa: BLE001
         return []
     selected = files[:max_files]
@@ -139,6 +134,7 @@ def tail_error_logs(
     max_files: int = 3,
     max_bytes: int = 32_000,
     scan_bytes_per_file: int = 1_000_000,
+    since: float | None = None,
     home: str | None = None,
     hostname: str | None = None,
 ) -> list[dict]:
@@ -148,6 +144,8 @@ def tail_error_logs(
             key=os.path.getmtime,
             reverse=True,
         )[:max_files]
+        if since is not None:
+            files = [path for path in files if os.path.getmtime(path) >= since]
     except Exception:  # noqa: BLE001
         return []
     out: list[dict] = []
@@ -203,6 +201,69 @@ def kernel_logs(
         except Exception:  # noqa: BLE001
             text = None
         out[key] = redact_text(text[-cap:], home=home, hostname=hostname) if text else None
+    return out
+
+
+def steam_logs(
+    home: str,
+    *,
+    since: float,
+    max_files: int = 12,
+    max_bytes: int = 64_000,
+    home_redact: str | None = None,
+    hostname: str | None = None,
+) -> list[dict]:
+    roots = (
+        os.path.join(home, ".local/share/Steam/logs"),
+        os.path.join(home, ".steam/steam/logs"),
+        os.path.join(home, ".steam/root/logs"),
+    )
+    paths = []
+    seen = set()
+    for root in roots:
+        for path in sorted(glob.glob(os.path.join(root, "*.txt")) + glob.glob(os.path.join(root, "*.log"))):
+            try:
+                if path not in seen and os.path.getmtime(path) >= since:
+                    paths.append(path)
+                    seen.add(path)
+            except OSError:
+                continue
+    paths.sort(key=os.path.getmtime, reverse=True)
+    selected = paths[:max_files]
+    out: list[dict] = []
+    budget = max(0, max_bytes)
+    for index, path in enumerate(selected):
+        if budget <= 0:
+            break
+        share = max(1, budget // (len(selected) - index))
+        try:
+            data = _tail_file(path, share)
+        except OSError:
+            continue
+        text = _cap_text(redact_text(data, home=home_redact, hostname=hostname), share)
+        out.append({"name": os.path.basename(path), "text": text})
+        budget -= len(text.encode("utf-8"))
+    return out
+
+
+def session_logs(run, *, since: float, home: str, home_redact=None, hostname=None) -> dict:
+    since_arg = f"@{max(0, int(since))}"
+    commands = {
+        "plugin_loader": ["/usr/bin/journalctl", "--since", since_arg, "-u", "plugin_loader", "--no-pager", "-o", "short-iso"],
+        "kernel": ["/usr/bin/journalctl", "--since", since_arg, "-k", "--no-pager", "-o", "short-iso"],
+        "hhd": ["/usr/bin/journalctl", "--since", since_arg, "-u", "hhd.service", "--no-pager", "-o", "short-iso"],
+        "steam_gamescope": ["/usr/bin/journalctl", "--since", since_arg, "--no-pager", "-o", "short-iso", "_COMM=steam", "_COMM=steamwebhelper", "_COMM=gamescope", "_COMM=gamescope-session"],
+    }
+    out = {name: None for name in commands}
+    for name, command in commands.items():
+        try:
+            text = run(command)
+        except Exception:  # noqa: BLE001
+            text = None
+        out[name] = redact_text(text[-40_000:], home=home_redact, hostname=hostname) if text else None
+    out["steam"] = steam_logs(
+        home, since=since, home_redact=home_redact, hostname=hostname
+    )
     return out
 
 
@@ -381,38 +442,13 @@ def capabilities_from(state: dict, *, driver=None, route=None, led_path=None, la
     }
 
 
-def build_bundle(
-    *,
-    app: str,
-    categories,
-    text,
-    environment: dict,
-    capabilities: dict,
-    state: dict,
-    stores: dict,
-    logs: list,
-    errors: list | None = None,
-    runtime: dict | None = None,
-    kind: str = "bug",
-    kernel: dict | None = None,
-    sysfs: dict | None = None,
-    home: str | None = None,
-    hostname: str | None = None,
-) -> dict:
-    bundle = {
-        "schema": SCHEMA,
-        "app": app,
-        "kind": normalize_report_kind(kind),
-        "categories": list(categories or []),
-        "text": (text or "")[:_MAX_TEXT],
-        "environment": environment or {},
-        "capabilities": capabilities or {},
-        "state": state or {},
-        "stores": stores or {},
-        "logs": logs or [],
-        "errors": errors or [],
-        "runtime": runtime or {},
-        "kernel": kernel or {},
-        "sysfs": sysfs or {},
-    }
-    return redact_obj(bundle, home=home, hostname=hostname)
+def ensure_diagnostics_directory(directory: str) -> None:
+    """Create a readable log directory without changing existing permissions."""
+    try:
+        os.makedirs(directory, mode=0o755, exist_ok=False)
+    except FileExistsError:
+        if not os.path.isdir(directory):
+            raise
+    else:
+        # `mode` is filtered through umask; normalize only the new directory.
+        os.chmod(directory, 0o755)

@@ -1,14 +1,15 @@
 import os
 
 import colores_report.collector as report_collector
+from colores_report.recorder import LocalDiagnosticsRecorder
 from colores_report.collector import (
-    SCHEMA,
-    build_bundle,
     capabilities_from,
+    ensure_diagnostics_directory,
     kernel_logs,
     redact_obj,
     redact_text,
     rgb_conflict_cmds,
+    session_logs,
     sysfs_snapshot,
     tail_logs,
 )
@@ -248,43 +249,77 @@ def test_sysfs_snapshot_captures_bounded_hp_rgb_platform_interface(tmp_path):
     }
 
 
-def test_build_bundle_shape():
-    b = build_bundle(
-        app="colores", categories=["color"], text="x" * 5000,
-        environment={"os": "Bazzite"}, capabilities={"color": True},
-        state={}, stores={}, logs=[], kernel={"dmesg": "x", "journal": None},
-        sysfs={"leds": []}, errors=[{"name": "x.log", "text": "failed"}],
-        runtime={"suspend": {"last_error": "serial: RC73XA12345"}},
+def test_session_logs_query_recent_armada_journals_and_steam_files(tmp_path):
+    steam = tmp_path / ".local/share/Steam/logs"
+    steam.mkdir(parents=True)
+    recent = steam / "gameprocess_log.txt"
+    recent.write_text("error at /home/deck/private")
+    os.utime(recent, (200, 200))
+    old = steam / "old_log.txt"
+    old.write_text("old event")
+    os.utime(old, (10, 10))
+    commands = []
+
+    def run(command):
+        commands.append(command)
+        return "error /home/deck/problem" if "journalctl" in command[0] else None
+
+    logs = session_logs(run, since=100, home=str(tmp_path), home_redact="/home/deck")
+
+    assert len(commands) == 4
+    assert all("@100" in command for command in commands)
+    assert logs["plugin_loader"].startswith("error ~/problem")
+    assert logs["steam"] == [{"name": "gameprocess_log.txt", "text": "error ~/private"}]
+
+
+def test_existing_diagnostics_directory_permissions_are_unchanged(tmp_path):
+    directory = tmp_path / "colores-logs"
+    directory.mkdir()
+    directory.chmod(0o700)
+
+    ensure_diagnostics_directory(str(directory))
+
+    assert os.stat(directory).st_mode & 0o777 == 0o700
+
+
+def test_recorder_creates_readable_session_and_private_state(tmp_path):
+    directory = tmp_path / "Documents/colores-logs"
+    recorder = LocalDiagnosticsRecorder(str(directory), str(tmp_path), 100, lambda _cmd: "")
+
+    session_path = recorder.prepare()
+
+    assert os.stat(directory).st_mode & 0o777 == 0o755
+    assert os.stat(session_path).st_mode & 0o777 == 0o644
+    assert os.stat(recorder.state_path).st_mode & 0o777 == 0o600
+
+
+def test_recorder_tails_colores_plugin_logs_incrementally_and_redacts(tmp_path):
+    directory = tmp_path / "Documents/colores-logs"
+    plugin_logs = tmp_path / "plugin-logs"
+    plugin_logs.mkdir()
+    log = plugin_logs / "colores.log"
+    log.write_text("first /home/deck/private\n")
+    recorder = LocalDiagnosticsRecorder(
+        str(directory), str(tmp_path), 100, lambda _cmd: "", str(plugin_logs)
     )
-    assert b["schema"] == SCHEMA == 2
-    assert b["app"] == "colores" and b["kind"] == "bug"
-    assert b["categories"] == ["color"]
-    assert len(b["text"]) == 4000
-    assert b["kernel"] == {"dmesg": "x", "journal": None}
-    assert b["sysfs"] == {"leds": []}
-    assert b["errors"] == [{"name": "x.log", "text": "failed"}]
-    assert b["runtime"] == {"suspend": {"last_error": "serial: [serial]"}}
+    recorder.prepare()
 
+    first = recorder._read_colores_deltas(101)
+    log.write_text("first /home/deck/private\nsecond error\n")
+    second = recorder._read_colores_deltas(102)
 
-def test_build_bundle_marks_feature_without_changing_logs():
-    logs = [{"name": "colores.log", "text": "diagnostic context"}]
-    common = {
-        "app": "colores",
-        "categories": ["effects"],
-        "text": "please add an effect",
-        "environment": {},
-        "capabilities": {},
-        "state": {},
-        "stores": {},
-        "logs": logs,
-    }
-
-    feature = build_bundle(**common, kind="feature")
-    invalid = build_bundle(**common, kind="unexpected")
-
-    assert feature["kind"] == "feature"
-    assert invalid["kind"] == "bug"
-    assert feature["logs"] == invalid["logs"] == logs
+    assert first == [{
+        "timestamp": 101,
+        "source": "colores_file",
+        "file": "colores.log",
+        "message": "first ~/private",
+    }]
+    assert second == [{
+        "timestamp": 102,
+        "source": "colores_file",
+        "file": "colores.log",
+        "message": "second error",
+    }]
 
 
 def test_sysfs_snapshot_captures_led_latch_attrs(tmp_path):
