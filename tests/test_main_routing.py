@@ -101,6 +101,9 @@ class FakeEngine:
     def stop(self):
         self.events.append(("stop",))
 
+    async def stop_and_wait(self):
+        self.events.append(("stop_and_wait",))
+
     @property
     def running(self):
         return False
@@ -122,31 +125,58 @@ class FakeAmbilight:
     def __init__(self):
         self.events = []
         self.status = "idle"
+        self._running = False
+        self._active = False
 
     def stop(self):
         self.events.append(("stop",))
+        self._running = False
+        self._active = False
 
     @property
     def running(self):
-        return False
+        return self._running
+
+    def set_active(self, active):
+        active = bool(active)
+        if active != self._active:
+            self.events.append(("active", active))
+            self._active = active
 
     async def stop_and_wait(self):
         self.events.append(("stop_and_wait",))
+        self._running = False
+        self._active = False
 
     def start(self, cfg):
-        self.events.append(("start", cfg))
+        self.events.append(("update" if self._running else "start", cfg))
+        self._running = True
+        self._active = True
 
 
 class FakeAudio:
     def __init__(self):
         self.events = []
         self.status = "idle"
+        self._running = False
 
     def stop(self):
         self.events.append(("stop",))
+        self._running = False
+
+    @property
+    def running(self):
+        return self._running
+
+    async def stop_and_wait(self):
+        self.events.append(("stop_and_wait",))
+        self._running = False
 
     def start(self, options=None):
+        if self._running:
+            return
         self.events.append(("start", options))
+        self._running = True
 
 
 class FakeHhdRgb:
@@ -229,6 +259,9 @@ def _plugin(
     p._resume_lock = asyncio.Lock()
     p._resume_handled_at = None
     p._hhd_rgb_lock = asyncio.Lock()
+    p._capture_transition_generation = 0
+    p._capture_transition_task = None
+    p._capture_owner = None
     p._hhd_rgb_status = None
     p._controller = FakeController(hw, per_zone)
     p._engine = FakeEngine()
@@ -269,111 +302,73 @@ def _hhd_plugin(
     return plugin, saved
 
 
-def test_submit_report_forwards_feature_kind(main_module, monkeypatch):
+def test_toggle_diagnostics_capture_persists_enabled_state(main_module, tmp_path):
     plugin = main_module.Plugin()
     plugin._ready = True
-    plugin._redact_ids = lambda: ("/home/deck", "deck")
-    captured = {}
+    plugin._settings = {"diagnostics_capture_enabled": False, "diagnostics_capture_since": None}
+    plugin._persist_settings = lambda: None
+    plugin._diagnostics_directory = lambda: str(tmp_path)
+    plugin._run_capture = lambda cmd: ""
 
-    async def build_bundle(categories, text, home, hostname, kind):
-        captured.update(
-            categories=categories,
-            text=text,
-            home=home,
-            hostname=hostname,
-            kind=kind,
-        )
-        return {"app": "colores", "kind": kind, "logs": ["context"]}
+    state = asyncio.run(plugin.set_diagnostics_capture(True))
 
-    plugin._build_report_bundle = build_bundle
-    monkeypatch.setattr(
-        main_module.report_client,
-        "submit",
-        lambda *_args, **_kwargs: {"ok": True, "code": "COL-TEST"},
-    )
-
-    result = asyncio.run(
-        plugin.submit_report(["effects"], "Please add an effect", "feature")
-    )
-
-    assert result == {"ok": True, "code": "COL-TEST", "issue_url": None}
-    assert captured == {
-        "categories": ["effects"],
-        "text": "Please add an effect",
-        "home": "/home/deck",
-        "hostname": "deck",
-        "kind": "feature",
-    }
+    assert state["enabled"] is True
+    assert state["since"] is not None
+    assert state["has_logs"] is True
+    assert state["active_file"] is not None
+    assert "diagnostics capture started" in open(state["active_file"], encoding="utf-8").read()
 
 
-def test_report_runtime_diagnostics_exposes_lifecycle_and_rgb_ownership(main_module):
-    plugin = _plugin(main_module, "ambient", hhd_takeover=True)
-    plugin._suspend_monitor = FakeSuspendMonitor()
-    plugin._suspend_prepared = True
-    plugin._settings.update(force_control=True, hhd_rgb_restore=True)
-    plugin._hhd_rgb_status = "disabled"
-
-    runtime = plugin._report_runtime_diagnostics()
-
-    assert runtime == {
-        "suspend": {
-            "running": True,
-            "connected": True,
-            "inhibitor_armed": True,
-            "sleeping": False,
-            "last_error": None,
-            "prepared": True,
-        },
-        "render": {
-            "engine_running": False,
-            "ambilight_running": False,
-            "ambilight_status": "idle",
-            "audio_status": "idle",
-        },
-        "hhd_rgb": {
-            "takeover_supported": True,
-            "force_control": True,
-            "status": "disabled",
-            "restore_pending": True,
-        },
-    }
-
-
-def test_report_bundle_wires_error_summary_and_runtime_diagnostics(
+def test_delete_diagnostics_logs_stops_capture_and_removes_directory(
     main_module, monkeypatch, tmp_path
 ):
-    plugin = _plugin(main_module, "solid", hhd_takeover=True)
-    plugin._suspend_monitor = FakeSuspendMonitor()
-    plugin._device = {"name": "ROG Ally", "board": "RC71L", "product": "RC71L"}
-    log = tmp_path / "colores.log"
-    log.write_text("[ERROR] failed at /home/deck/private\nordinary frame\n")
-    monkeypatch.setattr(
-        main_module.decky,
-        "DECKY_PLUGIN_LOG_DIR",
-        str(tmp_path),
-        raising=False,
-    )
-    plugin._report_environment = lambda: {"os": "SteamOS"}
-    plugin._report_stores = lambda: {}
-    plugin._run_capture = lambda command: None
+    home = tmp_path / "home"
+    logs = home / "Documents" / "colores-logs"
+    logs.mkdir(parents=True)
+    (logs / "colores-session-test.jsonl").write_text("diagnostic data")
+    (logs / ".colores-capture-state.json").write_text("{}")
+    monkeypatch.setattr(main_module.decky, "DECKY_USER_HOME", str(home), raising=False)
+    plugin = main_module.Plugin()
+    plugin._ready = True
+    plugin._settings = {"diagnostics_capture_enabled": True, "diagnostics_capture_since": 123}
+    plugin._persist_settings = lambda: None
+    stopped = []
 
-    async def get_state():
-        return {"device": plugin._device, "capabilities": plugin._capabilities}
+    async def stop_recorder():
+        stopped.append(True)
+        plugin._diagnostics_task = None
+        plugin._diagnostics_recorder = None
 
-    plugin.get_state = get_state
+    plugin._stop_diagnostics_recorder = stop_recorder
 
-    bundle = asyncio.run(
-        plugin._build_report_bundle(
-            ["color"], "does not light", "/home/deck", "handheld", "bug"
-        )
-    )
+    state = asyncio.run(plugin.delete_diagnostics_logs())
 
-    assert bundle["errors"] == [{
-        "name": "colores.log",
-        "text": "[ERROR] failed at ~/private",
-    }]
-    assert bundle["runtime"]["suspend"]["connected"] is True
-    assert bundle["capabilities"]["hhd_rgb_takeover"] is True
+    assert not logs.exists()
+    assert stopped == [True]
+    assert plugin._settings["diagnostics_capture_enabled"] is False
+    assert plugin._settings["diagnostics_capture_since"] is None
+    assert state["enabled"] is False
+    assert state["has_logs"] is False
+    assert state["error"] is None
+
+
+def test_delete_diagnostics_logs_refuses_unexpected_path(main_module, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    unexpected = tmp_path / "other" / "colores-logs"
+    unexpected.mkdir(parents=True)
+    (unexpected / "keep.txt").write_text("keep")
+    monkeypatch.setattr(main_module.decky, "DECKY_USER_HOME", str(home), raising=False)
+    plugin = main_module.Plugin()
+    plugin._ready = True
+    plugin._settings = {"diagnostics_capture_enabled": False, "diagnostics_capture_since": None}
+    plugin._persist_settings = lambda: None
+    plugin._diagnostics_directory = lambda: str(unexpected)
+    plugin._stop_diagnostics_recorder = lambda: asyncio.sleep(0)
+
+    state = asyncio.run(plugin.delete_diagnostics_logs())
+
+    assert (unexpected / "keep.txt").exists()
+    assert state["error"] == "delete_failed"
 
 
 @pytest.mark.parametrize(
@@ -432,8 +427,126 @@ def test_vu_mode_starts_audio_capture(main_module):
     p = _plugin(main_module, "vu", hw=False, per_zone=True)
     p._apply()
     assert any(e[0] == "start" for e in p._audio.events)
-    assert ("stop",) in p._ambilight.events
-    assert p._engine.events and p._engine.events[-1][0] == "stop"
+    assert p._capture_owner == "vu"
+
+
+def test_ambilight_to_vu_keeps_pipewire_capture_warm(main_module):
+    async def drive():
+        p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+        p._apply()
+        timeline = []
+        engine_stop = p._engine.stop_and_wait
+        audio_stop = p._audio.stop_and_wait
+        audio_start = p._audio.start
+        ambilight_active = p._ambilight.set_active
+
+        def record_ambilight_active(active):
+            changed = p._ambilight._active != bool(active)
+            ambilight_active(active)
+            if changed:
+                timeline.append(f"ambilight active={active}")
+
+        async def record_engine_stop():
+            await engine_stop()
+            timeline.append("engine stopped")
+
+        async def record_audio_stop():
+            await audio_stop()
+            timeline.append("audio stopped")
+
+        def record_audio_start(options=None):
+            timeline.append("audio started")
+            audio_start(options)
+
+        p._ambilight.set_active = record_ambilight_active
+        p._engine.stop_and_wait = record_engine_stop
+        p._audio.stop_and_wait = record_audio_stop
+        p._audio.start = record_audio_start
+        p._settings["mode"] = "vu"
+        p._apply()
+        await p._capture_transition_task
+
+        assert p._capture_owner == "vu"
+        assert p._ambilight.running
+        assert not p._ambilight._active
+        assert ("stop_and_wait",) not in p._ambilight.events
+        assert timeline == [
+            "ambilight active=False",
+            "audio stopped",
+            "engine stopped",
+            "audio started",
+        ]
+
+    asyncio.run(drive())
+
+
+def test_rapid_ambilight_audio_switches_leave_only_latest_worker_running(main_module):
+    async def drive():
+        p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+        p._apply()
+        entered_stop = asyncio.Event()
+        release_stop = asyncio.Event()
+        original_stop = p._audio.stop_and_wait
+
+        async def blocked_stop():
+            entered_stop.set()
+            await release_stop.wait()
+            await original_stop()
+
+        p._audio.stop_and_wait = blocked_stop
+        p._settings["mode"] = "vu"
+        p._apply()
+        await entered_stop.wait()
+        p._settings["mode"] = "ambient"
+        p._apply()
+        p._settings["mode"] = "vu"
+        p._apply()
+        release_stop.set()
+        await p._capture_transition_task
+
+        starts = [event for event in p._audio.events if event[0] == "start"]
+        assert len(starts) == 1
+        assert p._capture_owner == "vu"
+        assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+        assert not any(event[0] == "stop_and_wait" for event in p._ambilight.events)
+
+    asyncio.run(drive())
+
+
+def test_rapid_ambient_vu_cycles_reuse_one_video_capture(main_module):
+    async def drive():
+        p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+        p._apply()
+        for mode in ("vu", "ambient", "vu", "ambient", "vu", "ambient"):
+            p._settings["mode"] = mode
+            p._apply()
+            task = p._capture_transition_task
+            if task is not None:
+                await task
+
+        assert p._capture_owner == "ambient"
+        assert p._ambilight.running
+        assert p._ambilight._active
+        assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+        assert not any(event[0] == "stop_and_wait" for event in p._ambilight.events)
+
+        p._settings["mode"] = "solid"
+        p._apply()
+        await p._capture_transition_task
+        assert not p._ambilight.running
+        assert sum(event[0] == "stop_and_wait" for event in p._ambilight.events) == 1
+
+    asyncio.run(drive())
+
+
+def test_reapplying_ambient_does_not_restart_capture(main_module):
+    p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+    p._apply()
+    p._apply()
+
+    assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+    assert sum(event[0] == "update" for event in p._ambilight.events) == 1
+    assert p._capture_owner == "ambient"
 
 
 def test_non_vu_mode_stops_audio(main_module):
@@ -707,12 +820,29 @@ def test_reconnect_reasserts_sleep_charging_policy(main_module):
     assert ("sleep_charging", True) in p._controller.calls
 
 
-def test_reconnect_restarts_ambient_capture(main_module):
+def test_capture_render_callbacks_only_write_for_current_owner(main_module):
+    p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+
+    p._capture_owner = "ambient"
+    p._render_ambient([(1, 2, 3)] * p._zones)
+    p._render_vu([(4, 5, 6)] * p._zones)
+    assert len(p._controller.calls) == 1
+    assert p._controller.calls[0][1] == [(1, 2, 3)] * p._zones
+
+    p._capture_owner = "vu"
+    p._settings["mode"] = "vu"
+    p._render_ambient([(7, 8, 9)] * p._zones)
+    p._render_vu([(10, 11, 12)] * p._zones)
+    assert len(p._controller.calls) == 2
+    assert p._controller.calls[1][1] == [(10, 11, 12)] * p._zones
+
+
+def test_reconnect_does_not_churn_ambient_capture(main_module):
     p = _plugin(main_module, "ambient", hw=False, per_zone=True)
     p._ambilight.events.clear()
     ok = asyncio.run(p.reconnect())
     assert ok is True
-    assert [event[0] for event in p._ambilight.events] == ["stop", "start"]
+    assert [event[0] for event in p._ambilight.events] == ["start"]
 
 
 def test_prepare_suspend_stops_capture_without_changing_user_intent(main_module):

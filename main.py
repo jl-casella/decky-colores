@@ -1,7 +1,8 @@
 import asyncio
-import json
+import glob
 import os
 import pwd
+import shutil
 import time
 
 import decky
@@ -25,13 +26,7 @@ from saved_gradients import upsert_gradient, remove_gradient
 from hhd_rgb_control import HhdRgbControl
 from suspend_monitor import SuspendMonitor
 import self_updater
-from colores_report import collector as report_collector
-from colores_report import client as report_client
-
-_REPORT_APP = "colores"
-_REPORT_SERVICE_URL = os.environ.get(
-    "COLORES_REPORT_URL", "https://bug-collector-khaki.vercel.app/api/report"
-)
+from colores_report.recorder import LocalDiagnosticsRecorder
 
 SENSOR_BAND_DEFAULTS = {
     "battery": BATTERY_BANDS,
@@ -62,6 +57,8 @@ DEFAULTS = {
     "sensor_bands": dict(SENSOR_BAND_DEFAULTS),
     "remember_startup": True,
     "startup_factory": None,
+    "diagnostics_capture_enabled": False,
+    "diagnostics_capture_since": None,
 }
 
 PROFILE_KEYS = (
@@ -212,6 +209,11 @@ class Plugin:
             logger=decky.logger,
         )
         self._hhd_rgb_lock = asyncio.Lock()
+        self._diagnostics_task = None
+        self._diagnostics_recorder = None
+        self._capture_transition_generation = 0
+        self._capture_transition_task = None
+        self._capture_owner = None
         self._hhd_rgb_status = None
         self._setup_device(self._build_context())
         self._store = SettingsStore(
@@ -269,7 +271,7 @@ class Plugin:
         self._engine = EffectEngine(self._render, self._zones, max_fps=max_render_fps)
         runtime_dir, uid, gid = _user_creds()
         self._ambilight = Ambilight(
-            self._render,
+            self._render_ambient,
             self._zones,
             runtime_dir,
             uid,
@@ -277,7 +279,9 @@ class Plugin:
             layout=self._capabilities.get("layout"),
             max_fps=max_render_fps,
         )
-        self._audio = AudioReactive(self._render, self._zones, runtime_dir, uid, gid)
+        self._audio = AudioReactive(
+            self._render_vu, self._zones, runtime_dir, uid, gid
+        )
 
     def _reprobe_device(self) -> bool:
         if self._controller.available:
@@ -363,135 +367,155 @@ class Plugin:
     async def restart_loader(self) -> None:
         self_updater.restart_loader()
 
-    async def submit_report(
-        self, categories=None, text: str = "", kind: str = "bug"
-    ) -> dict:
+    async def get_diagnostics_capture(self) -> dict:
         self._init()
-        home, hostname = self._redact_ids()
-        report_kind = report_collector.normalize_report_kind(kind)
-        try:
-            bundle = await self._build_report_bundle(
-                categories, text, home, hostname, report_kind
-            )
-        except Exception as e:  # noqa: BLE001
-            decky.logger.error("Colores: report bundle failed: %s", e)
-            bundle = report_collector.build_bundle(
-                app=_REPORT_APP, categories=categories, text=text,
-                environment={}, capabilities={}, state={}, stores={}, logs=[],
-                kind=report_kind,
-                home=home, hostname=hostname,
-            )
-            bundle["error"] = "bundle_incomplete"
-        res = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: report_client.submit(_REPORT_SERVICE_URL, bundle)
-        )
-        if res.get("ok"):
-            decky.logger.info("Colores: report sent: %s", res.get("code"))
-            return {"ok": True, "code": res["code"], "issue_url": res.get("issue_url")}
-        path = report_client.save_local(
-            getattr(decky, "DECKY_PLUGIN_LOG_DIR", "."), bundle
-        )
-        decky.logger.warning(
-            "Colores: report send failed (%s); saved to %s", res.get("error"), path
-        )
-        return {"ok": False, "error": res.get("error", "unknown"), "saved_path": path}
-
-    def _redact_ids(self):
-        home = getattr(decky, "DECKY_USER_HOME", None) or os.path.expanduser("~")
-        try:
-            import socket
-
-            hostname = socket.gethostname()
-        except Exception:  # noqa: BLE001
-            hostname = None
-        return home, hostname
-
-    async def _build_report_bundle(
-        self, categories, text, home, hostname, kind: str = "bug"
-    ) -> dict:
-        loop = asyncio.get_running_loop()
-        try:
-            state = await self.get_state()
-        except Exception:  # noqa: BLE001
-            state = {}
-        capabilities = report_collector.capabilities_from(
-            state,
-            driver=type(self._controller).__name__,
-            route=getattr(self._controller, "route", None),
-            led_path=getattr(self._controller, "led_path", None),
-            last_error=getattr(self._controller, "last_error", None),
-        )
-        runtime = self._report_runtime_diagnostics()
-
-        def _assemble() -> dict:
-            logs = report_collector.tail_logs(
-                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""), home=home, hostname=hostname
-            )
-            errors = report_collector.tail_error_logs(
-                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""), home=home, hostname=hostname
-            )
-            snapshot = report_collector.sysfs_snapshot(home=home, hostname=hostname)
-            kernel = report_collector.kernel_logs(
-                self._run_capture,
-                extra=report_collector.rgb_conflict_cmds(
-                    bool(capabilities.get("conflicts_with_system_rgb"))
-                ),
-                home=home,
-                hostname=hostname,
-            )
-            return report_collector.build_bundle(
-                app=_REPORT_APP,
-                kind=kind,
-                categories=categories,
-                text=text,
-                environment=self._report_environment(),
-                capabilities=capabilities,
-                state=state,
-                stores=self._report_stores(),
-                logs=logs,
-                errors=errors,
-                runtime=runtime,
-                kernel=kernel,
-                sysfs=snapshot,
-                home=home,
-                hostname=hostname,
-            )
-
-        return await loop.run_in_executor(None, _assemble)
-
-    def _report_runtime_diagnostics(self) -> dict:
-        def running(component):
-            probe = getattr(component, "running", None)
+        enabled = bool(self._settings.get("diagnostics_capture_enabled", False))
+        error = None
+        if enabled:
             try:
-                return bool(probe() if callable(probe) else probe)
-            except Exception:  # noqa: BLE001
-                return None
-
-        monitor = getattr(self, "_suspend_monitor", None)
-        try:
-            suspend = monitor.diagnostics() if monitor else {}
-        except Exception:  # noqa: BLE001
-            suspend = {}
-        suspend["prepared"] = bool(getattr(self, "_suspend_prepared", False))
-        settings = getattr(self, "_settings", {})
-        capabilities = getattr(self, "_capabilities", {})
+                self._start_diagnostics_recorder()
+            except Exception as start_error:  # noqa: BLE001
+                decky.logger.error("Colores: diagnostics recorder resume failed: %s", start_error)
+                error = "capture_start_failed"
+        files = self._diagnostics_files()
         return {
-            "suspend": suspend,
-            "render": {
-                "engine_running": running(getattr(self, "_engine", None)),
-                "ambilight_running": running(getattr(self, "_ambilight", None)),
-                "ambilight_status": getattr(getattr(self, "_ambilight", None), "status", None),
-                "audio_status": getattr(getattr(self, "_audio", None), "status", None),
-            },
-            "hhd_rgb": {
-                "takeover_supported": bool(capabilities.get("hhdRgbTakeover")),
-                "force_control": bool(settings.get("force_control")),
-                "status": getattr(self, "_hhd_rgb_status", None),
-                "restore_pending": settings.get("hhd_rgb_restore") is True,
-            },
+            "enabled": enabled,
+            "since": self._settings.get("diagnostics_capture_since"),
+            "directory": self._diagnostics_directory(),
+            "active_file": self._diagnostics_recorder.current_file()
+            if enabled and self._diagnostics_recorder
+            else None,
+            "has_logs": bool(files),
+            "error": error,
         }
 
-    def _run_capture(self, cmd) -> str | None:
+    async def set_diagnostics_capture(self, enabled: bool) -> dict:
+        self._init()
+        enabled = bool(enabled)
+        current = bool(self._settings.get("diagnostics_capture_enabled", False))
+        if enabled == current:
+            if enabled:
+                try:
+                    self._start_diagnostics_recorder()
+                except Exception as error:  # noqa: BLE001
+                    decky.logger.error("Colores: diagnostics recorder start failed: %s", error)
+                    result = await self.get_diagnostics_capture()
+                    result["error"] = "capture_start_failed"
+                    return result
+            return await self.get_diagnostics_capture()
+        if enabled:
+            started = time.time()
+            home = self._diagnostics_home()
+            recorder = LocalDiagnosticsRecorder(
+                self._diagnostics_directory(), home, started, self._run_capture,
+                getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""),
+            )
+            try:
+                recorder.prepare()
+            except Exception as error:  # noqa: BLE001
+                decky.logger.error("Colores: diagnostics directory unavailable: %s", error)
+                result = await self.get_diagnostics_capture()
+                result["error"] = "capture_start_failed"
+                return result
+            self._diagnostics_recorder = recorder
+        self._settings["diagnostics_capture_enabled"] = enabled
+        self._settings["diagnostics_capture_since"] = started if enabled else None
+        try:
+            self._persist_settings()
+        except Exception as error:  # noqa: BLE001
+            if enabled:
+                await self._stop_diagnostics_recorder()
+            self._settings["diagnostics_capture_enabled"] = current
+            self._settings["diagnostics_capture_since"] = None
+            decky.logger.error("Colores: diagnostics capture setting save failed: %s", error)
+            result = await self.get_diagnostics_capture()
+            result["error"] = "capture_start_failed"
+            return result
+        decky.logger.info("Colores: local diagnostics capture %s", "enabled" if enabled else "disabled")
+        if enabled:
+            self._diagnostics_task = asyncio.create_task(self._diagnostics_recorder.run())
+        else:
+            await self._stop_diagnostics_recorder()
+        return await self.get_diagnostics_capture()
+
+    async def delete_diagnostics_logs(self) -> dict:
+        self._init()
+        previous_enabled = bool(self._settings.get("diagnostics_capture_enabled", False))
+        previous_since = self._settings.get("diagnostics_capture_since")
+        self._settings["diagnostics_capture_enabled"] = False
+        self._settings["diagnostics_capture_since"] = None
+        try:
+            self._persist_settings()
+        except Exception as error:  # noqa: BLE001
+            self._settings["diagnostics_capture_enabled"] = previous_enabled
+            self._settings["diagnostics_capture_since"] = previous_since
+            decky.logger.error("Colores: diagnostics setting reset failed before deleting logs: %s", error)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+
+        await self._stop_diagnostics_recorder()
+        directory = os.path.abspath(self._diagnostics_directory())
+        home = self._diagnostics_home()
+        expected_parent = os.path.abspath(os.path.join(home, "Documents"))
+        if os.path.dirname(directory) != expected_parent or os.path.basename(directory) != "colores-logs":
+            decky.logger.error("Colores: refusing to delete unexpected diagnostics path: %s", directory)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: os.unlink(directory)
+                if os.path.islink(directory)
+                else shutil.rmtree(directory, ignore_errors=False),
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            decky.logger.error("Colores: diagnostics log deletion failed: %s", error)
+            status = await self.get_diagnostics_capture()
+            status["error"] = "delete_failed"
+            return status
+        decky.logger.info("Colores: local diagnostics logs deleted")
+        return await self.get_diagnostics_capture()
+
+    def _diagnostics_files(self) -> list[str]:
+        return sorted(glob.glob(os.path.join(
+            self._diagnostics_directory(), "colores-session-*.jsonl"
+        )))
+
+    def _start_diagnostics_recorder(self) -> None:
+        task = getattr(self, "_diagnostics_task", None)
+        if task is not None and not task.done():
+            return
+        home = self._diagnostics_home()
+        since = self._settings.get("diagnostics_capture_since") or time.time()
+        recorder = LocalDiagnosticsRecorder(
+            self._diagnostics_directory(), home, since, self._run_capture,
+            getattr(decky, "DECKY_PLUGIN_LOG_DIR", ""),
+        )
+        recorder.prepare()
+        self._diagnostics_recorder = recorder
+        self._diagnostics_task = asyncio.create_task(recorder.run())
+
+    async def _stop_diagnostics_recorder(self) -> None:
+        task = getattr(self, "_diagnostics_task", None)
+        self._diagnostics_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._diagnostics_recorder = None
+
+    def _diagnostics_directory(self) -> str:
+        return os.path.join(self._diagnostics_home(), "Documents", "colores-logs")
+
+    @staticmethod
+    def _diagnostics_home() -> str:
+        return getattr(decky, "DECKY_USER_HOME", None) or os.path.expanduser("~")
+
+    def _run_capture(self, cmd) -> dict:
         try:
             import subprocess
 
@@ -501,63 +525,29 @@ class Plugin:
             r = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=5, env=env,
             )  # noqa: S603
-            return r.stdout or ""
-        except Exception:  # noqa: BLE001
-            return None
-
-    def _report_environment(self) -> dict:
-        def _dmi(name):
-            try:
-                with open(f"/sys/class/dmi/id/{name}") as f:
-                    return f.read().strip()
-            except OSError:
-                return None
-
-        os_name = None
-        try:
-            rel = {}
-            with open("/etc/os-release") as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.rstrip().split("=", 1)
-                        rel[k] = v.strip('"')
-            os_name = rel.get("PRETTY_NAME") or rel.get("NAME")
-        except Exception:  # noqa: BLE001
-            pass
-        kernel = None
-        try:
-            u = os.uname()
-            kernel = f"{u.sysname} {u.release}"
-        except Exception:  # noqa: BLE001
-            pass
-        dev = getattr(self, "_device", {}) or {}
-        return {
-            "plugin_version": read_version(),
-            "decky_version": getattr(decky, "DECKY_VERSION", None),
-            "device_key": dev.get("name"),
-            "product_name": dev.get("product") or _dmi("product_name"),
-            "product_family": _dmi("product_family"),
-            "board_name": dev.get("board") or _dmi("board_name"),
-            "os": os_name,
-            "kernel": kernel,
-        }
-
-    def _report_stores(self) -> dict:
-        base = getattr(decky, "DECKY_PLUGIN_SETTINGS_DIR", "")
-        try:
-            with open(os.path.join(base, "state.json")) as f:
-                settings = json.load(f)
-        except Exception:  # noqa: BLE001
-            settings = getattr(self, "_settings", {})
-        stores = {"settings": settings}
-        profiles = getattr(self, "_profiles", None)
-        if profiles is not None:
-            stores["profiles"] = {
-                "profiles_configured": profiles.configured_count(),
-                "watcher_state": "game" if self._current_app_key else "global",
-                "fallback_reason": None,
+            return {
+                "stdout": r.stdout or "",
+                "stderr": r.stderr or "",
+                "returncode": r.returncode,
+                "error": None,
             }
-        return stores
+        except Exception as error:  # noqa: BLE001
+            import subprocess
+
+            if isinstance(error, subprocess.TimeoutExpired):
+                kind = "timeout"
+            elif isinstance(error, FileNotFoundError):
+                kind = "command_not_found"
+            elif isinstance(error, PermissionError):
+                kind = "permission_denied"
+            else:
+                kind = type(error).__name__
+            return {
+                "stdout": "",
+                "stderr": "",
+                "returncode": None,
+                "error": kind,
+            }
 
     def _serialized_saved(self) -> list:
         return [_saved(g) for g in self._settings["saved_gradients"]]
@@ -712,9 +702,6 @@ class Plugin:
         if key == self._current_app_key:
             return self._profile_state("game" if key else "global", key)
         self._current_app_key = key
-        self._ambilight.stop()
-        self._audio.stop()
-        self._engine.stop()
         self._sync_effective_profile()
         self._apply()
         return self._profile_state("game" if key else "global", key)
@@ -955,8 +942,6 @@ class Plugin:
         if hasattr(self, "_profiles"):
             self._sync_effective_profile()
         self._apply_sleep_charging_indicator()
-        if self._settings["mode"] == "ambient":
-            self._ambilight.stop()
         self._apply()
         return bool(ok)
 
@@ -974,8 +959,15 @@ class Plugin:
             self._resume_handled_at = None
             mode = self._settings["mode"]
             if mode == "ambient":
+                self._capture_owner = None
                 await self._ambilight.stop_and_wait()
                 decky.logger.info("Colores: ambilight capture stopped for suspend")
+                return
+            if mode == "vu" and self._ambilight.running:
+                # A warm video stream is useful only while awake; VU remains the
+                # RGB owner, and Ambient can reconnect on demand after resume.
+                await self._ambilight.stop_and_wait()
+                decky.logger.info("Colores: warm ambilight capture stopped for suspend")
                 return
             if mode != "vu" and self._wants_render_loop():
                 await self._engine.stop_and_wait()
@@ -1122,6 +1114,24 @@ class Plugin:
             zone_colors, self._settings["brightness"], self._effective_power()
         )
 
+    def _render_ambient(self, zone_colors) -> None:
+        if (
+            getattr(self, "_capture_owner", None) != "ambient"
+            or self._settings.get("mode") != "ambient"
+            or not self._effective_power()
+        ):
+            return
+        self._render(zone_colors)
+
+    def _render_vu(self, zone_colors) -> None:
+        if (
+            getattr(self, "_capture_owner", None) != "vu"
+            or self._settings.get("mode") != "vu"
+            or not self._effective_power()
+        ):
+            return
+        self._render(zone_colors)
+
     def _save_and_apply(self) -> None:
         self._persist_settings()
         self._apply()
@@ -1149,6 +1159,13 @@ class Plugin:
 
     def _apply(self) -> None:
         if getattr(self, "_suspend_prepared", False):
+            return
+        capture_target = self._effective_power() and self._settings["mode"] in (
+            "ambient",
+            "vu",
+        )
+        if self._capture_work_active() and not capture_target:
+            self._schedule_capture_transition()
             return
         if self._controller.supports_hardware_effects() and not self._wants_render_loop():
             self._apply_hardware()
@@ -1184,39 +1201,34 @@ class Plugin:
     def _apply_per_zone(self) -> None:
         s = self._settings
         if not self._effective_power():
-            self._ambilight.stop()
-            self._audio.stop()
-            self._engine.set_static([(0, 0, 0)] * self._zones)
+            if self._capture_work_active():
+                self._schedule_capture_transition()
+            else:
+                self._engine.set_static([(0, 0, 0)] * self._zones)
             return
 
-        if s["mode"] == "ambient":
-            self._audio.stop()
-            self._engine.stop()
-            amb = s["ambilight"]
-            self._ambilight.start(
-                {
-                    "saturation": 1.0 + (amb["vividness"] / 100) * 1.5,
-                    "smoothing": amb["smoothing"],
-                    "fps": amb.get("fps", 10),
-                    "sampling": amb.get("sampling", "columns"),
-                    "global_color": not (
-                        self._capabilities.get("perZone")
-                        or self._capabilities.get("perControllerColor")
-                    ),
-                    "fallback": tuple(s["color"]),
-                }
-            )
-            return
-
-        if s["mode"] == "vu":
-            self._ambilight.stop()
-            self._engine.stop()
-            self._audio.start()
+        if s["mode"] in ("ambient", "vu") or self._capture_work_active():
+            self._schedule_capture_transition()
             return
 
         self._ambilight.stop()
         self._audio.stop()
+        self._apply_non_capture_mode()
 
+    def _capture_work_active(self) -> bool:
+        task = getattr(self, "_capture_transition_task", None)
+        return bool(
+            getattr(self, "_capture_owner", None)
+            or (task is not None and not task.done())
+            or self._ambilight.running
+            or self._audio.running
+        )
+
+    def _apply_non_capture_mode(self) -> None:
+        s = self._settings
+        if not self._effective_power():
+            self._engine.set_static([(0, 0, 0)] * self._zones)
+            return
         if s["mode"] == "battery":
             self._engine.start_battery(self._battery_state)
         elif s["mode"] == "temperature":
@@ -1247,6 +1259,133 @@ class Plugin:
         else:
             self._engine.set_static([tuple(s["color"])] * self._zones)
 
+    def _schedule_capture_transition(self) -> None:
+        """Serialize capture-mode handoffs before any new effect can write RGB."""
+        mode = self._settings["mode"]
+        task = self._capture_transition_task
+        if (
+            mode in ("ambient", "vu")
+            and (task is None or task.done())
+            and self._capture_owner == mode
+            and (self._ambilight.running if mode == "ambient" else self._audio.running)
+        ):
+            # Profile refreshes and repeated UI selections should update options,
+            # not tear down/recreate the Gamescope PipeWire video stream.
+            if mode == "ambient":
+                self._start_capture_mode(mode)
+            decky.logger.info(
+                "Colores: RGB mode unchanged owner=%s; capture retained", mode
+            )
+            return
+
+        self._capture_transition_generation += 1
+        generation = self._capture_transition_generation
+        decky.logger.info(
+            "Colores: RGB mode transition requested owner=%s target=%s generation=%s",
+            self._capture_owner,
+            mode,
+            generation,
+        )
+        if (
+            mode in ("ambient", "vu")
+            and (task is None or task.done())
+            and getattr(self, "_capture_owner", None) is None
+            and not self._audio.running
+            and not self._engine.running
+        ):
+            self._start_capture_mode(mode)
+            self._capture_owner = mode
+            decky.logger.info(
+                "Colores: RGB mode transition complete owner=%s generation=%s",
+                mode,
+                generation,
+            )
+            return
+        if task is None or task.done():
+            self._capture_transition_task = asyncio.create_task(
+                self._run_capture_transition_queue()
+            )
+
+    def _start_capture_mode(self, mode: str) -> None:
+        if mode == "ambient":
+            s = self._settings
+            amb = s["ambilight"]
+            self._ambilight.start(
+                {
+                    "saturation": 1.0 + (amb["vividness"] / 100) * 1.5,
+                    "smoothing": amb["smoothing"],
+                    "fps": amb.get("fps", 10),
+                    "sampling": amb.get("sampling", "columns"),
+                    "global_color": not (
+                        self._capabilities.get("perZone")
+                        or self._capabilities.get("perControllerColor")
+                    ),
+                    "fallback": tuple(s["color"]),
+                }
+            )
+        elif mode == "vu":
+            # Keep an existing video capture connection warm, but never let its
+            # frames write RGB while VU owns the LEDs.
+            self._ambilight.set_active(False)
+            self._audio.start()
+
+    async def _run_capture_transition_queue(self) -> None:
+        while True:
+            generation = self._capture_transition_generation
+            mode = self._settings["mode"]
+            active = self._effective_power() and mode in ("ambient", "vu")
+            target = mode if active else None
+            decky.logger.info(
+                "Colores: RGB mode transition stopping owner=%s target=%s generation=%s",
+                self._capture_owner,
+                target,
+                generation,
+            )
+            # Gate stale callbacks immediately. Keep an established Ambilight
+            # PipeWire stream connected across VU so quick mode changes do not
+            # repeatedly destroy/recreate Gamescope's video buffers.
+            self._capture_owner = None
+            self._ambilight.set_active(False)
+            await self._audio.stop_and_wait()
+            await self._engine.stop_and_wait()
+
+            if generation != self._capture_transition_generation:
+                decky.logger.info(
+                    "Colores: RGB transition superseded generation=%s latest=%s",
+                    generation,
+                    self._capture_transition_generation,
+                )
+                continue
+
+            if target is not None:
+                self._capture_owner = target
+                self._start_capture_mode(target)
+            else:
+                # Leaving both capture modes is the point where the retained
+                # video stream is no longer useful; release it exactly once.
+                await self._ambilight.stop_and_wait()
+                if generation != self._capture_transition_generation:
+                    decky.logger.info(
+                        "Colores: RGB transition superseded after capture release generation=%s latest=%s",
+                        generation,
+                        self._capture_transition_generation,
+                    )
+                    continue
+                # Clear the coordinator before applying the requested non-
+                # capture mode so _apply can safely select its normal backend.
+                self._capture_transition_task = None
+                self._apply()
+
+            self._capture_owner = target
+            decky.logger.info(
+                "Colores: RGB mode transition complete owner=%s generation=%s",
+                target,
+                generation,
+            )
+            if generation == self._capture_transition_generation:
+                self._capture_transition_task = None
+                return
+
     async def _main(self):
         self._init()
         if self._settings.get("force_control"):
@@ -1272,6 +1411,11 @@ class Plugin:
         )
         self._suspend_monitor.start()
         self._apply()
+        if self._settings.get("diagnostics_capture_enabled", False):
+            try:
+                self._start_diagnostics_recorder()
+            except OSError as error:
+                decky.logger.error("Colores: diagnostics recorder resume failed: %s", error)
         self._reassert_task = asyncio.create_task(self._acquire_and_reassert())
         self._charger_task = asyncio.create_task(self._charger_watch())
         self._resume_task = asyncio.create_task(self._resume_watch())
@@ -1383,6 +1527,7 @@ class Plugin:
             "_resume_task",
             "_force_control_task",
             "_startup_task",
+            "_diagnostics_task",
         ):
             task = getattr(self, attr, None)
             if task:
@@ -1390,19 +1535,35 @@ class Plugin:
                 tasks.append(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._diagnostics_task = None
+        self._diagnostics_recorder = None
 
     async def _unload(self):
         await self._stop_background_tasks()
+        transition = getattr(self, "_capture_transition_task", None)
+        if transition is not None:
+            await asyncio.gather(transition, return_exceptions=True)
         if getattr(self, "_ready", False):
             await self._restore_hhd_rgb()
         if getattr(self, "_ambilight", None):
-            self._ambilight.stop()
+            await self._ambilight.stop_and_wait()
+        if getattr(self, "_audio", None):
+            await self._audio.stop_and_wait()
         if getattr(self, "_engine", None):
-            self._engine.stop()
+            await self._engine.stop_and_wait()
         decky.logger.info("Colores unloaded")
 
     async def _uninstall(self):
         await self._stop_background_tasks()
+        transition = getattr(self, "_capture_transition_task", None)
+        if transition is not None:
+            await asyncio.gather(transition, return_exceptions=True)
+        if getattr(self, "_ambilight", None):
+            await self._ambilight.stop_and_wait()
+        if getattr(self, "_audio", None):
+            await self._audio.stop_and_wait()
+        if getattr(self, "_engine", None):
+            await self._engine.stop_and_wait()
         if getattr(self, "_ready", False):
             await self._restore_hhd_rgb()
         decky.logger.info("Colores uninstalled")

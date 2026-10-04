@@ -11,6 +11,8 @@ import { Capabilities, DeviceInfo, PowerLedState } from "../types";
 
 const AUTHOR = "Hooandee";
 const YOUTUBE_URL = "https://www.youtube.com/@Hooandee";
+const PORT_AUTHOR = "jl-casella";
+const PORT_REPOSITORY_URL = "https://github.com/jl-casella/decky-colores";
 
 let versionCache = "";
 
@@ -80,7 +82,9 @@ export const SettingsSection: FC<SettingsSectionProps> = ({
   }, []);
 
   const openChannel = () => Navigation.NavigateToExternalWeb(YOUTUBE_URL);
+  const openPortRepository = () => Navigation.NavigateToExternalWeb(PORT_REPOSITORY_URL);
   const [madeByBefore, madeByAfter] = t("about.madeBy").split("{name}");
+  const [portedByBefore, portedByAfter] = t("about.portedBy").split("{name}");
   const unvalidated = !(caps.color || caps.brightness);
 
   const sections: ReactNode[] = [
@@ -233,6 +237,17 @@ export const SettingsSection: FC<SettingsSectionProps> = ({
             {AUTHOR}
           </Focusable>
           {madeByAfter}
+          <br />
+          {portedByBefore}
+          <Focusable
+            onActivate={openPortRepository}
+            onClick={openPortRepository}
+            aria-label={PORT_AUTHOR}
+            style={{ display: "inline", color: "#58a6ff", cursor: "pointer", textDecoration: "underline" }}
+          >
+            {PORT_AUTHOR}
+          </Focusable>
+          {portedByAfter}
         </div>
       </PanelSectionRow>
     </>,

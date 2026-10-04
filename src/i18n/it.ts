@@ -194,6 +194,7 @@ export const it: Record<string, string> = {
   "about.title": "Informazioni",
   "about.version": "Versione {v}",
   "about.madeBy": "Realizzato da {name}",
+  "about.portedBy": "Portato su Armada da {name}",
 
   "experimental.title": "Funzioni sperimentali",
   "experimental.description":
@@ -213,57 +214,23 @@ export const it: Record<string, string> = {
   "sleepCharging.label": "Indicatore di carica durante la sospensione",
   "sleepCharging.hint": "Fa lampeggiare gli anelli mentre la console è sospesa e in carica.",
 
-  "report.button": "Invia una segnalazione",
-  "report.button.desc":
-    "Qualcosa non funziona o vorresti una nuova funzione in Colores? Raccontamelo e includerò anche il contesto tecnico delle luci.",
+  "report.button": "Diagnostica un problema",
+  "report.button.desc": "Registra i log localmente per analizzare i problemi.",
   "report.unvalidated.note":
     "Non ho ancora accesso fisico a questo dispositivo. Sto facendo del mio meglio per supportarlo e le tue segnalazioni mi aiutano moltissimo a perfezionare le luci.",
-  "report.title": "Invia una segnalazione",
-  "report.intro":
-    "Indica cosa non funziona e dimmi cosa hai notato. Le informazioni tecniche sulle luci vengono raccolte automaticamente.",
-  "report.intro.feature":
-    "Questa non è una segnalazione di errore. Dimmi cosa vorresti aggiungere o migliorare in Colores; raccoglierò anche il contesto tecnico delle luci.",
-  "report.section.kind": "Cosa vuoi inviare?",
-  "report.kind.bug": "Un problema",
-  "report.kind.feature": "Una richiesta o idea",
-  "report.kind.change": "Cambia",
-  "report.section.what": "Cosa non funziona?",
-  "report.section.what.feature": "A quale parte si riferisce?",
-  "report.cat.color": "Colore",
-  "report.cat.brightness": "Luminosità",
-  "report.cat.effects": "Effetti",
-  "report.cat.ambilight": "Ambilight",
-  "report.cat.battery": "Modalità batteria",
-  "report.cat.powerLed": "LED di accensione",
-  "report.cat.other": "Altro",
-  "report.section.describe": "Descrivi cosa è successo (obbligatorio)",
-  "report.section.describe.feature": "Descrivi cosa vorresti (obbligatorio)",
-  "report.describe.hint":
-    "Senza una descrizione non posso capire cosa non va. Dimmi cosa ti aspettavi e cosa è successo.",
-  "report.describe.hint.feature":
-    "Spiegami cosa vuoi ottenere, come ti aiuterebbe e, se puoi, fai un esempio.",
-  "report.privacy.title": "Cosa viene inviato · cosa è pubblico",
-  "report.privacy.public":
-    "Pubblico: la segnalazione contiene solo un riepilogo (modello, versione, categorie e il tuo testo).",
-  "report.privacy.private":
-    "Privato: i log e lo stato completo NON sono pubblici; vengono compressi, cifrati e solo Hooandee può leggerli.",
-  "report.privacy.nopii": "Nessun dato personale · solo contesto tecnico.",
-  "report.send": "Crea e invia segnalazione",
-  "report.sending": "Invio in corso…",
-  "report.done.title": "Segnalazione inviata!",
-  "report.done.thanks": "Grazie. Ora ho tutto ciò che mi serve per capire cosa è successo.",
-  "report.done.thanks.feature":
-    "Grazie. Ora ho la tua richiesta e il contesto tecnico necessario per valutarla.",
-  "report.code.label": "Codice della segnalazione",
-  "report.code.hint":
-    "Conservalo. Se mi contatti per questo problema, indicami questo codice e lo troverò subito (non serve alcun account).",
-  "report.code.hint.feature":
-    "Conservalo. Se mi contatti per questa richiesta, indicami questo codice e la troverò subito (non serve alcun account).",
-  "report.copy": "Copia codice",
-  "report.copied": "Copiato!",
-  "report.close": "Chiudi",
-  "report.error.title": "Invio non riuscito. Controlla la connessione.",
-  "report.error.saved":
-    "Ho salvato la segnalazione in {path}. Puoi inviarmela manualmente.",
-  "report.retry": "Riprova",
+  "report.title": "Diagnostica un problema",
+  "report.intro": "I log vengono raccolti localmente mentre la cattura è attiva.",
+  "report.privacy.title": "Cosa viene raccolto e dove viene salvato",
+  "report.privacy.local": "I log restano su questo dispositivo e possono essere letti dagli altri account locali.",
+  "report.privacy.redaction": "Gli identificatori noti vengono rimossi; controlla il file prima di condividerlo perché i log possono contenere altri dati.",
+  "report.privacy.manual": "Colores non invia nulla. Trova il file e allegalo manualmente a un issue del repository.",
+  "report.capture.toggle": "Attiva la raccolta diagnostica",
+  "report.capture.duration": "Mantiene una finestra mobile di 30 minuti e continua finché non la disattivi.",
+  "report.capture.location": "I file vengono salvati in {path}.",
+  "report.capture.sources": "Include log di Colores, plugin_loader/kernel, HHD e file recenti di Steam/Gamescope disponibili.",
+  "report.capture.error": "Impossibile leggere o modificare l'impostazione di raccolta.",
+  "report.capture.delete": "Elimina tutti i log",
+  "report.capture.deleting": "Eliminazione log…",
+  "report.capture.deleted": "Tutti i log sono stati eliminati.",
+  "report.capture.delete_error": "Impossibile eliminare i log. Controlla i permessi della cartella.",
 };

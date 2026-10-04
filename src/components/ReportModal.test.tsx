@@ -22,18 +22,23 @@ vi.mock("@decky/ui", async () => {
   return {
     DialogButton: ({ children, ...props }: { children?: ReactNode }) =>
       React.createElement("button", props, children),
+    ToggleField: (props: { label?: string; checked?: boolean; description?: string }) =>
+      React.createElement("div", props, props.label),
+    PanelSectionRow: ({ children }: { children?: ReactNode }) =>
+      React.createElement("div", null, children),
     Focusable: ({ children, onActivate, onClick, ...props }: FocusableProps) => {
       mocks.focusables.push({ children, onActivate, onClick, ...props });
       return React.createElement("div", props, children);
     },
     ModalRoot: ({ children }: { children?: ReactNode }) => children,
     showModal: (node: ReactNode) => { mocks.modal = node; },
-    TextField: (props: object) => React.createElement("input", props),
   };
 });
 
 vi.mock("../api", () => ({
-  submitReport: vi.fn(),
+  getDiagnosticsCapture: vi.fn(() => new Promise(() => {})),
+  setDiagnosticsCapture: vi.fn(),
+  deleteDiagnosticsLogs: vi.fn(),
 }));
 
 vi.mock("../i18n", () => ({
@@ -48,8 +53,6 @@ vi.mock("./FocusRoot", () => ({
 import {
   openReportModal,
   reportFocusTarget,
-  selectionChipA11y,
-  selectionChipStyle,
 } from "./ReportModal";
 
 const device = {
@@ -58,65 +61,45 @@ const device = {
   board: "MS-1T41",
 };
 
-describe("ReportModal request type", () => {
+describe("ReportModal local diagnostics", () => {
   afterEach(() => {
     mocks.modal = null;
     mocks.focusables.length = 0;
     vi.unstubAllGlobals();
   });
 
-  it("starts with an explicit report type choice before showing the form", () => {
+  it("shows local capture guidance without categories or issue links", () => {
     vi.stubGlobal("window", {});
     openReportModal(device);
     const html = renderToStaticMarkup(createElement("div", null, mocks.modal));
 
-    const problem = mocks.focusables.find(
-      (props) => props["aria-label"] === "report.kind.bug",
-    );
-    const feature = mocks.focusables.find(
-      (props) => props["aria-label"] === "report.kind.feature",
-    );
-
-    expect(problem).toMatchObject({
-      role: "radio",
-      "aria-checked": false,
-      preferredFocus: true,
-    });
-    expect(feature).toMatchObject({ role: "radio", "aria-checked": false });
     expect(html).toContain("MSI Claw");
-    expect(
-      mocks.focusables.some((props) => props["aria-label"]?.startsWith("report.cat.")),
-    ).toBe(false);
+    expect(html).toContain("report.capture.toggle");
+    expect(html).toContain("report.privacy.local");
+    expect(html).toContain("report.capture.delete");
+    expect(html).toContain("report.capture.sources");
+    expect(html).not.toContain("report.capture.save");
+    expect(html).not.toContain("<input");
+    expect(html).not.toContain("report.section.what");
+    expect(html).not.toContain("report.cat.");
+    expect(html).not.toContain("report.issues.link");
   });
 
-  it("draws a distinct gamepad focus state for category chips", () => {
-    expect(selectionChipStyle(false, true).boxShadow).toContain("2px");
-    expect(selectionChipStyle(false, true).boxShadow).not.toBe(
-      selectionChipStyle(false, false).boxShadow,
-    );
-  });
-
-  it("hands focus to the first category after choosing a report type", () => {
-    const category = {} as HTMLElement;
-    const root = { querySelector: vi.fn(() => category) };
-
-    expect(reportFocusTarget(root, "form", false, "bug")).toBe(category);
-    expect(root.querySelector).toHaveBeenCalledWith('[data-report-category="true"]');
-  });
-
-  it("hands focus to the primary action after submission finishes", () => {
+  it("hands focus to the primary action in the form", () => {
     const action = {} as HTMLElement;
     const root = { querySelector: vi.fn(() => action) };
 
-    expect(reportFocusTarget(root, "done", false, "bug")).toBe(action);
-    expect(reportFocusTarget(root, "error", false, "bug")).toBe(action);
+    expect(reportFocusTarget(root)).toBe(action);
+    expect(root.querySelector).toHaveBeenCalledWith('[data-report-primary-action="true"]');
+  });
+
+  it("uses the same primary action as the modal focus target", () => {
+    const action = {} as HTMLElement;
+    const root = { querySelector: vi.fn(() => action) };
+
+    expect(reportFocusTarget(root)).toBe(action);
     expect(root.querySelector).toHaveBeenCalledWith(
       '[data-report-primary-action="true"]',
     );
-  });
-
-  it("exposes report categories as checked or unchecked checkboxes", () => {
-    expect(selectionChipA11y(true)).toEqual({ role: "checkbox", "aria-checked": true });
-    expect(selectionChipA11y(false)).toEqual({ role: "checkbox", "aria-checked": false });
   });
 });

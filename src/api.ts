@@ -58,16 +58,15 @@ export const checkUpdate = callable<[force: boolean], UpdateInfo>("check_update"
 export const installUpdate = callable<[], InstallResult>("install_update");
 export const restartLoader = callable<[], void>("restart_loader");
 
-export interface ReportResult {
-  ok: boolean;
-  code?: string;
-  issue_url?: string;
-  error?: string;
-  saved_path?: string;
+export interface DiagnosticCaptureState {
+  enabled: boolean;
+  since: number | null;
+  directory: string;
+  active_file?: string | null;
+  has_logs: boolean;
+  error?: string | null;
 }
 
-export const submitReport =
-  callable<
-    [categories: string[], text: string, kind: "bug" | "feature"],
-    ReportResult
-  >("submit_report");
+export const getDiagnosticsCapture = callable<[], DiagnosticCaptureState>("get_diagnostics_capture");
+export const setDiagnosticsCapture = callable<[enabled: boolean], DiagnosticCaptureState>("set_diagnostics_capture");
+export const deleteDiagnosticsLogs = callable<[], DiagnosticCaptureState>("delete_diagnostics_logs");

@@ -24,6 +24,8 @@ ODIN2_CAP_H = 36
 # the (root) plugin loads, so the capture must keep retrying instead of giving up —
 # otherwise ambient mode stays dark until the user manually re-selects it.
 RETRY_INTERVAL = 3.0
+MAX_RETRY_INTERVAL = 30.0
+STABLE_CAPTURE_INTERVAL = 15.0
 
 _NATIVE_ENV_KEYS = (
     "LD_LIBRARY_PATH",
@@ -271,6 +273,7 @@ class Ambilight:
         self._task = None
         self._proc = None
         self._options = {}
+        self._active = False
         self.status = "idle"
         self._current = [(0, 0, 0)] * self._zones
         self._targets = [(0, 0, 0)] * self._zones
@@ -327,7 +330,16 @@ class Ambilight:
                     proc.kill()
                 except ProcessLookupError:
                     pass
+                await asyncio.gather(proc.wait(), return_exceptions=True)
             return None
+        except asyncio.CancelledError:
+            if proc is not None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await asyncio.gather(proc.wait(), return_exceptions=True)
+            raise
         for obj in data:
             props = (obj.get("info") or {}).get("props") or {}
             if props.get("node.name") == GAMESCOPE_NODE and "Video" in str(
@@ -339,13 +351,34 @@ class Ambilight:
     def start(self, options):
         self._options = options or {}
         if self.running:
+            self.set_active(True)
             return
         self.stop()
+        self.set_active(True)
+        logger.info("ambilight worker starting")
         self._task = asyncio.get_event_loop().create_task(self._run())
 
+    def set_active(self, active):
+        active = bool(active)
+        if active == self._active:
+            return
+        self._active = active
+        if self.running:
+            if active:
+                self.status = (
+                    "running" if self._proc is not None
+                    else "no_source" if self._backend is not None
+                    else "unavailable"
+                )
+            else:
+                self.status = "paused"
+        logger.info("ambilight rendering %s", "resumed" if active else "paused")
+
     def stop(self):
+        self.set_active(False)
         self.status = "idle"
         if self._task is not None:
+            logger.info("ambilight worker stop requested")
             self._task.cancel()
             self._task = None
         self._kill()
@@ -353,11 +386,15 @@ class Ambilight:
     async def stop_and_wait(self):
         task = self._task
         proc = self._proc
+        if task is not None:
+            logger.info("ambilight worker stopping")
         self.stop()
         pending = [task] if task is not None else []
         if proc is not None:
             pending.append(proc.wait())
         await asyncio.gather(*pending, return_exceptions=True)
+        if task is not None or proc is not None:
+            logger.info("ambilight worker stopped; capture process reaped")
 
     def _kill(self):
         if self._proc is not None:
@@ -372,20 +409,23 @@ class Ambilight:
         # until stop() cancels us. The source can be absent at boot (session not up yet)
         # or vanish (leaving Game Mode) and reappear — we recover from both automatically.
         frame_bytes = self._capture_width * self._capture_height * 3
+        retry_delay = RETRY_INTERVAL
         while True:
             if self._backend is None:
                 self._backend = resolve_capture_backend()
                 if self._backend is None:
-                    self.status = "unavailable"
-                    self._apply(self._fallback())
+                    self.status = "unavailable" if self._active else "paused"
+                    if self._active:
+                        self._apply(self._fallback())
                     await asyncio.sleep(RETRY_INTERVAL)
                     continue
                 logger.info("ambilight capture backend: %s", self._backend.name)
             node = await self._find_node()
             if node is None:
                 logger.warning("gamescope PipeWire node not found; retrying")
-                self.status = "no_source"
-                self._apply(self._fallback())
+                self.status = "no_source" if self._active else "paused"
+                if self._active:
+                    self._apply(self._fallback())
                 await asyncio.sleep(RETRY_INTERVAL)
                 continue
 
@@ -408,22 +448,31 @@ class Ambilight:
                     **self._cred(),
                 )
                 self._proc = proc
-                self.status = "running"
+                self.status = "running" if self._active else "paused"
                 frames = asyncio.Queue(maxsize=1)
                 reader_task = asyncio.create_task(
                     _read_latest_frames(proc.stdout, frame_bytes, frames)
                 )
+                capture_started = asyncio.get_running_loop().time()
                 while True:
                     frame = await frames.get()
                     if isinstance(frame, Exception):
                         raise frame
-                    self._update_targets(frame)
-                    self._tick()
-                    await asyncio.sleep(interval)
+                    if (
+                        retry_delay > RETRY_INTERVAL
+                        and asyncio.get_running_loop().time() - capture_started
+                        >= STABLE_CAPTURE_INTERVAL
+                    ):
+                        retry_delay = RETRY_INTERVAL
+                    if self._active:
+                        self._update_targets(frame)
+                        self._tick()
+                    await asyncio.sleep(self._capture_interval())
             except asyncio.IncompleteReadError:
-                self.status = "no_source"
+                self.status = "no_source" if self._active else "paused"
                 await self._log_exit(proc)
-                self._apply(self._fallback())
+                if self._active:
+                    self._apply(self._fallback())
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -437,9 +486,12 @@ class Ambilight:
                         proc.kill()
                     except ProcessLookupError:
                         pass
+                    await asyncio.gather(proc.wait(), return_exceptions=True)
                 if self._proc is proc:
                     self._proc = None
-            await asyncio.sleep(RETRY_INTERVAL)
+            logger.warning("ambilight reconnect scheduled in %.1fs", retry_delay)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, MAX_RETRY_INTERVAL)
 
     async def _log_exit(self, proc):
         if proc is None:
@@ -512,6 +564,8 @@ class Ambilight:
                     )
 
     def _tick(self):
+        if not self._active:
+            return
         base_alpha = alpha_for(self._options.get("smoothing", 75))
         self._current = [
             lerp(
