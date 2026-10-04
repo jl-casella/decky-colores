@@ -212,9 +212,11 @@ class Runtime:
             def start(self, options):
                 self._options = options or {}
                 self._emulator_running = True
+                self.set_active(True)
                 self.status = "no_source"
 
             def stop(self):
+                self.set_active(False)
                 self._emulator_running = False
                 self.status = "idle"
 
