@@ -1,4 +1,5 @@
 import os
+import time
 
 import colores_report.collector as report_collector
 from colores_report.recorder import LocalDiagnosticsRecorder
@@ -269,7 +270,7 @@ def test_session_logs_query_recent_armada_journals_and_steam_files(tmp_path):
     assert len(commands) == 4
     assert all("@100" in command for command in commands)
     assert logs["plugin_loader"].startswith("error ~/problem")
-    assert logs["steam"] == [{"name": "gameprocess_log.txt", "text": "error ~/private"}]
+    assert logs["steam"] == [{"name": "gameprocess_log.txt", "text": "error at ~/private"}]
 
 
 def test_existing_diagnostics_directory_permissions_are_unchanged(tmp_path):
@@ -320,6 +321,108 @@ def test_recorder_tails_colores_plugin_logs_incrementally_and_redacts(tmp_path):
         "file": "colores.log",
         "message": "second error",
     }]
+
+
+def test_recorder_marks_journal_permission_failures_instead_of_silently_skipping(tmp_path):
+    now = time.time()
+
+    def denied(_command):
+        return {
+            "stdout": "",
+            "stderr": "Failed to open journal at /home/deck/private: Permission denied",
+            "returncode": 1,
+            "error": None,
+        }
+
+    recorder = LocalDiagnosticsRecorder(
+        str(tmp_path / "Documents/colores-logs"), str(tmp_path), now - 1, denied,
+    )
+    recorder.poll_once()
+    health = [record for record in recorder.read_records() if record["source"] == "capture_health"]
+
+    assert len(health) == 6
+    assert all(record["status"] == "failed" for record in health)
+    assert all(record["returncode"] == 1 for record in health)
+    assert all("~/private" in record["detail"] for record in health)
+    assert all("/home/deck" not in record["detail"] for record in health)
+
+
+def test_recorder_distinguishes_empty_journal_from_query_failure(tmp_path):
+    recorder = LocalDiagnosticsRecorder(
+        str(tmp_path / "Documents/colores-logs"), str(tmp_path),
+        time.time() - 1, lambda _command: "",
+    )
+    recorder.poll_once()
+
+    health = [record for record in recorder.read_records() if record["source"] == "capture_health"]
+
+    assert len(health) == 6
+    assert all(record["status"] == "empty" for record in health)
+
+
+def test_recorder_does_not_label_journal_warning_as_empty(tmp_path):
+    recorder = LocalDiagnosticsRecorder(
+        str(tmp_path / "Documents/colores-logs"), str(tmp_path),
+        time.time() - 1, lambda _command: {
+            "stdout": "",
+            "stderr": "No journal files were found",
+            "returncode": 0,
+            "error": None,
+        },
+    )
+    recorder.poll_once()
+    health = [record for record in recorder.read_records() if record["source"] == "capture_health"]
+
+    assert len(health) == 6
+    assert all(record["status"] == "warning" for record in health)
+    assert all(record["detail"] == "No journal files were found" for record in health)
+
+
+def test_recorder_queries_user_journal_and_explicit_plugin_loader_unit(tmp_path):
+    commands = []
+
+    def capture(command):
+        commands.append(command)
+        return ""
+
+    recorder = LocalDiagnosticsRecorder(
+        str(tmp_path / "Documents/colores-logs"), str(tmp_path), time.time() - 1, capture,
+    )
+    recorder.poll_once()
+
+    assert any("--user" in command and "-p" in command for command in commands)
+    assert any("-u" in command and "plugin_loader.service" in command for command in commands)
+    assert {record["target"] for record in recorder.read_records() if record["source"] == "capture_health"} == {
+        "plugin_loader", "kernel", "hhd", "steam_gamescope", "system_coredump", "user_journal",
+    }
+
+
+def test_recorder_preserves_bounded_coredump_identity_and_backtrace(tmp_path):
+    import json
+
+    recorder = LocalDiagnosticsRecorder(
+        str(tmp_path / "Documents/colores-logs"), str(tmp_path), time.time() - 1, lambda _command: "",
+    )
+    stacktrace = ("#0 /home/deck/private/" + "x" * 40 + "\n") * 500
+    output = json.dumps({
+        "__REALTIME_TIMESTAMP": "1000000",
+        "MESSAGE": stacktrace,
+        "COREDUMP_PID": "1234",
+        "COREDUMP_SIGNAL": "11",
+        "COREDUMP_SIGNAL_NAME": "SIGSEGV",
+        "COREDUMP_EXE": "/home/deck/bin/steamwebhelper",
+        "COREDUMP_STACKTRACE": stacktrace,
+    })
+
+    _, records = recorder._parse_journal_output("system_coredump", output)
+    record = records[0]
+
+    assert record["coredump_pid"] == "1234"
+    assert record["coredump_signal_name"] == "SIGSEGV"
+    assert record["coredump_exe"] == "~/bin/steamwebhelper"
+    assert len(record["message"]) == 12_000
+    assert len(record["coredump_stacktrace"]) == 12_000
+    assert "/home/deck" not in record["message"]
 
 
 def test_sysfs_snapshot_captures_led_latch_attrs(tmp_path):

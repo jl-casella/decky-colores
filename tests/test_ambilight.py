@@ -303,6 +303,23 @@ def test_capture_interval_respects_device_render_limit():
     assert amb._capture_interval() == pytest.approx(0.1)
 
 
+def test_paused_warm_capture_drains_without_writing_rgb():
+    applied = []
+    amb = Ambilight(lambda colors: applied.append(list(colors)), zones=1, runtime_dir=None)
+    amb._options = {"smoothing": 0}
+    amb._targets = [(255, 0, 0)]
+
+    amb.set_active(True)
+    amb._tick()
+    assert len(applied) == 1
+
+    amb.set_active(False)
+    amb._targets = [(0, 0, 255)]
+    amb._tick()
+    assert len(applied) == 1
+    assert amb.status == "idle"
+
+
 def test_stop_and_wait_reaps_capture_before_returning():
     class FakeProcess:
         def __init__(self):

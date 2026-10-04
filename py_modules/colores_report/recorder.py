@@ -13,10 +13,12 @@ POLL_INTERVAL_SECONDS = 15
 RETENTION_SECONDS = 30 * 60
 MAX_CAPTURE_BYTES = 10 * 1024 * 1024
 MAX_BATCH_BYTES = 512 * 1024
-MAX_STEAM_FILE_BYTES = 64 * 1024
+MAX_LOG_FILE_DELTA_BYTES = 64 * 1024
+MAX_COREDUMP_MESSAGE_CHARS = 12_000
+COREDUMP_MESSAGE_ID = "fc2e22bc6ee647b6b90729ab34a250b1"
 
 _JOURNAL_QUERIES = {
-    "plugin_loader": ["-u", "plugin_loader"],
+    "plugin_loader": ["-u", "plugin_loader.service"],
     "kernel": ["-k"],
     "hhd": ["-u", "hhd.service"],
     "steam_gamescope": [
@@ -25,6 +27,10 @@ _JOURNAL_QUERIES = {
         "_COMM=gamescope",
         "_COMM=gamescope-session",
     ],
+    "system_coredump": [f"MESSAGE_ID={COREDUMP_MESSAGE_ID}"],
+    # Decky and other desktop components may log to the user's journal rather
+    # than the system journal. Keep this separate so access failures are clear.
+    "user_journal": ["--user", "-p", "warning"],
 }
 
 
@@ -82,14 +88,18 @@ class LocalDiagnosticsRecorder:
             if cursor:
                 args.append(f"--after-cursor={cursor}")
             args.extend(filters)
-            try:
-                output = self.runner(args)
-            except Exception:  # noqa: BLE001
-                output = None
-            if not output:
+            result = self._run_journal_query(args)
+            output = result["stdout"]
+            if result["error"] or result["returncode"] != 0:
+                records.append(self._source_health_record(source, result, now, status="failed"))
                 continue
             next_cursor, journal_records = self._parse_journal_output(source, output)
             records.extend(journal_records)
+            records.append(self._source_health_record(
+                source, result, now,
+                status=("ok" if journal_records else "warning" if result["stderr"].strip() else "empty"),
+                record_count=len(journal_records),
+            ))
             if next_cursor:
                 cursors[source] = next_cursor
 
@@ -99,6 +109,50 @@ class LocalDiagnosticsRecorder:
         self._append_records(records)
         self._prune(now)
         self._save_state()
+
+    def _run_journal_query(self, args: list[str]) -> dict:
+        try:
+            result = self.runner(args)
+        except Exception as error:  # noqa: BLE001
+            return {
+                "stdout": "", "stderr": "", "returncode": None,
+                "error": type(error).__name__,
+            }
+        # Keep compatibility with lightweight/custom runners while the plugin
+        # runner exposes stderr and the exit code for proper source health.
+        if isinstance(result, str):
+            return {"stdout": result, "stderr": "", "returncode": 0, "error": None}
+        if not isinstance(result, dict):
+            return {
+                "stdout": "", "stderr": "", "returncode": None,
+                "error": "runner_no_result",
+            }
+        return {
+            "stdout": result.get("stdout") if isinstance(result.get("stdout"), str) else "",
+            "stderr": result.get("stderr") if isinstance(result.get("stderr"), str) else "",
+            "returncode": result.get("returncode"),
+            "error": result.get("error"),
+        }
+
+    def _source_health_record(
+        self, source: str, result: dict, observed_at: float, *, status: str,
+        record_count: int = 0,
+    ) -> dict:
+        record = {
+            "timestamp": observed_at,
+            "source": "capture_health",
+            "target": source,
+            "status": status,
+            "records": record_count,
+        }
+        if result["returncode"] is not None:
+            record["returncode"] = result["returncode"]
+        if result["error"]:
+            record["error"] = redact_text(str(result["error"]), home=self.home)[:120]
+        detail = result["stderr"].strip()
+        if detail:
+            record["detail"] = redact_text(detail, home=self.home)[:240]
+        return record
 
     def read_records(self, since: float | None = None) -> list[dict]:
         cutoff = max(time.time() - RETENTION_SECONDS, since or 0)
@@ -160,15 +214,13 @@ class LocalDiagnosticsRecorder:
                 timestamp = int(entry.get("__REALTIME_TIMESTAMP", "0")) / 1_000_000
             except (TypeError, ValueError):
                 timestamp = time.time()
-            message = entry.get("MESSAGE", "")
-            if isinstance(message, list):
-                message = "".join(chr(value) for value in message if isinstance(value, int))
-            if isinstance(message, dict):
-                message = str(message)
+            message = self._journal_text(entry.get("MESSAGE", ""))
             record = {
                 "timestamp": timestamp,
                 "source": source,
-                "message": redact_text(str(message), home=self.home),
+                "message": redact_text(message, home=self.home)[
+                    :MAX_COREDUMP_MESSAGE_CHARS if source == "system_coredump" else None
+                ],
             }
             unit = entry.get("_SYSTEMD_UNIT")
             comm = entry.get("_COMM")
@@ -179,8 +231,35 @@ class LocalDiagnosticsRecorder:
                 record["process"] = redact_text(str(comm), home=self.home)
             if priority is not None:
                 record["priority"] = str(priority)
+            if source == "system_coredump":
+                for field, key, limit in (
+                    ("COREDUMP_PID", "coredump_pid", 32),
+                    ("COREDUMP_UID", "coredump_uid", 32),
+                    ("COREDUMP_GID", "coredump_gid", 32),
+                    ("COREDUMP_SIGNAL", "coredump_signal", 32),
+                    ("COREDUMP_SIGNAL_NAME", "coredump_signal_name", 64),
+                    ("COREDUMP_EXE", "coredump_exe", 512),
+                    ("COREDUMP_COMM", "coredump_comm", 256),
+                    ("COREDUMP_UNIT", "coredump_unit", 512),
+                    ("COREDUMP_USER_UNIT", "coredump_user_unit", 512),
+                    ("COREDUMP_TRUNCATED", "coredump_truncated", 16),
+                    ("COREDUMP_STACKTRACE", "coredump_stacktrace", MAX_COREDUMP_MESSAGE_CHARS),
+                ):
+                    value = entry.get(field)
+                    if value is not None:
+                        record[key] = redact_text(self._journal_text(value), home=self.home)[:limit]
             records.append(record)
         return cursor, records
+
+    @staticmethod
+    def _journal_text(value) -> str:
+        if isinstance(value, list):
+            return "".join(chr(item) for item in value if isinstance(item, int))
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        if isinstance(value, dict):
+            return str(value)
+        return "" if value is None else str(value)
 
     def _read_steam_deltas(self, observed_at: float) -> list[dict]:
         roots = (
@@ -219,25 +298,33 @@ class LocalDiagnosticsRecorder:
                 if stat.st_size < offset:
                     offset = 0
                 if not saved:
-                    offset = max(0, stat.st_size - MAX_STEAM_FILE_BYTES)
+                    offset = max(0, stat.st_size - MAX_LOG_FILE_DELTA_BYTES)
                 with open(path, "rb") as handle:
                     handle.seek(offset)
-                    raw = handle.read(MAX_STEAM_FILE_BYTES)
+                    raw = handle.read(MAX_LOG_FILE_DELTA_BYTES)
                     read_start = offset
                     if handle.tell() < stat.st_size:
                         handle.seek(0, os.SEEK_END)
                         end = handle.tell()
-                        read_start = max(offset, end - MAX_STEAM_FILE_BYTES)
+                        read_start = max(offset, end - MAX_LOG_FILE_DELTA_BYTES)
                         handle.seek(read_start)
-                        raw = handle.read(MAX_STEAM_FILE_BYTES)
+                        raw = handle.read(MAX_LOG_FILE_DELTA_BYTES)
                         offset = end
                     else:
                         offset = handle.tell()
+                    # If the saved offset is already at a line boundary, keep
+                    # the next complete line. Otherwise discard only the
+                    # partial line that began before this read.
+                    if read_start > 0:
+                        handle.seek(read_start - 1)
+                        starts_at_line_boundary = handle.read(1) == b"\n"
+                    else:
+                        starts_at_line_boundary = True
                 offsets[path] = {"identity": identity, "offset": offset}
             except OSError:
                 continue
             text = raw.decode("utf-8", "replace")
-            if read_start > 0 and "\n" in text:
+            if read_start > 0 and not starts_at_line_boundary and "\n" in text:
                 text = text[text.find("\n") + 1:]
             for line in text.splitlines():
                 if line.strip():

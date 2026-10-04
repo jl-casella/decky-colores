@@ -125,38 +125,58 @@ class FakeAmbilight:
     def __init__(self):
         self.events = []
         self.status = "idle"
+        self._running = False
+        self._active = False
 
     def stop(self):
         self.events.append(("stop",))
+        self._running = False
+        self._active = False
 
     @property
     def running(self):
-        return False
+        return self._running
+
+    def set_active(self, active):
+        active = bool(active)
+        if active != self._active:
+            self.events.append(("active", active))
+            self._active = active
 
     async def stop_and_wait(self):
         self.events.append(("stop_and_wait",))
+        self._running = False
+        self._active = False
 
     def start(self, cfg):
-        self.events.append(("start", cfg))
+        self.events.append(("update" if self._running else "start", cfg))
+        self._running = True
+        self._active = True
 
 
 class FakeAudio:
     def __init__(self):
         self.events = []
         self.status = "idle"
+        self._running = False
 
     def stop(self):
         self.events.append(("stop",))
+        self._running = False
 
     @property
     def running(self):
-        return False
+        return self._running
 
     async def stop_and_wait(self):
         self.events.append(("stop_and_wait",))
+        self._running = False
 
     def start(self, options=None):
+        if self._running:
+            return
         self.events.append(("start", options))
+        self._running = True
 
 
 class FakeHhdRgb:
@@ -410,19 +430,21 @@ def test_vu_mode_starts_audio_capture(main_module):
     assert p._capture_owner == "vu"
 
 
-def test_ambilight_to_audio_waits_for_ambilight_before_starting_audio(main_module):
+def test_ambilight_to_vu_keeps_pipewire_capture_warm(main_module):
     async def drive():
         p = _plugin(main_module, "ambient", hw=False, per_zone=True)
         p._apply()
         timeline = []
-        ambilight_stop = p._ambilight.stop_and_wait
         engine_stop = p._engine.stop_and_wait
         audio_stop = p._audio.stop_and_wait
         audio_start = p._audio.start
+        ambilight_active = p._ambilight.set_active
 
-        async def record_ambilight_stop():
-            await ambilight_stop()
-            timeline.append("ambilight stopped")
+        def record_ambilight_active(active):
+            changed = p._ambilight._active != bool(active)
+            ambilight_active(active)
+            if changed:
+                timeline.append(f"ambilight active={active}")
 
         async def record_engine_stop():
             await engine_stop()
@@ -436,7 +458,7 @@ def test_ambilight_to_audio_waits_for_ambilight_before_starting_audio(main_modul
             timeline.append("audio started")
             audio_start(options)
 
-        p._ambilight.stop_and_wait = record_ambilight_stop
+        p._ambilight.set_active = record_ambilight_active
         p._engine.stop_and_wait = record_engine_stop
         p._audio.stop_and_wait = record_audio_stop
         p._audio.start = record_audio_start
@@ -445,8 +467,11 @@ def test_ambilight_to_audio_waits_for_ambilight_before_starting_audio(main_modul
         await p._capture_transition_task
 
         assert p._capture_owner == "vu"
+        assert p._ambilight.running
+        assert not p._ambilight._active
+        assert ("stop_and_wait",) not in p._ambilight.events
         assert timeline == [
-            "ambilight stopped",
+            "ambilight active=False",
             "audio stopped",
             "engine stopped",
             "audio started",
@@ -461,14 +486,14 @@ def test_rapid_ambilight_audio_switches_leave_only_latest_worker_running(main_mo
         p._apply()
         entered_stop = asyncio.Event()
         release_stop = asyncio.Event()
-        original_stop = p._ambilight.stop_and_wait
+        original_stop = p._audio.stop_and_wait
 
         async def blocked_stop():
             entered_stop.set()
             await release_stop.wait()
             await original_stop()
 
-        p._ambilight.stop_and_wait = blocked_stop
+        p._audio.stop_and_wait = blocked_stop
         p._settings["mode"] = "vu"
         p._apply()
         await entered_stop.wait()
@@ -483,8 +508,45 @@ def test_rapid_ambilight_audio_switches_leave_only_latest_worker_running(main_mo
         assert len(starts) == 1
         assert p._capture_owner == "vu"
         assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+        assert not any(event[0] == "stop_and_wait" for event in p._ambilight.events)
 
     asyncio.run(drive())
+
+
+def test_rapid_ambient_vu_cycles_reuse_one_video_capture(main_module):
+    async def drive():
+        p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+        p._apply()
+        for mode in ("vu", "ambient", "vu", "ambient", "vu", "ambient"):
+            p._settings["mode"] = mode
+            p._apply()
+            task = p._capture_transition_task
+            if task is not None:
+                await task
+
+        assert p._capture_owner == "ambient"
+        assert p._ambilight.running
+        assert p._ambilight._active
+        assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+        assert not any(event[0] == "stop_and_wait" for event in p._ambilight.events)
+
+        p._settings["mode"] = "solid"
+        p._apply()
+        await p._capture_transition_task
+        assert not p._ambilight.running
+        assert sum(event[0] == "stop_and_wait" for event in p._ambilight.events) == 1
+
+    asyncio.run(drive())
+
+
+def test_reapplying_ambient_does_not_restart_capture(main_module):
+    p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+    p._apply()
+    p._apply()
+
+    assert sum(event[0] == "start" for event in p._ambilight.events) == 1
+    assert sum(event[0] == "update" for event in p._ambilight.events) == 1
+    assert p._capture_owner == "ambient"
 
 
 def test_non_vu_mode_stops_audio(main_module):
@@ -758,12 +820,29 @@ def test_reconnect_reasserts_sleep_charging_policy(main_module):
     assert ("sleep_charging", True) in p._controller.calls
 
 
-def test_reconnect_restarts_ambient_capture(main_module):
+def test_capture_render_callbacks_only_write_for_current_owner(main_module):
+    p = _plugin(main_module, "ambient", hw=False, per_zone=True)
+
+    p._capture_owner = "ambient"
+    p._render_ambient([(1, 2, 3)] * p._zones)
+    p._render_vu([(4, 5, 6)] * p._zones)
+    assert len(p._controller.calls) == 1
+    assert p._controller.calls[0][1] == [(1, 2, 3)] * p._zones
+
+    p._capture_owner = "vu"
+    p._settings["mode"] = "vu"
+    p._render_ambient([(7, 8, 9)] * p._zones)
+    p._render_vu([(10, 11, 12)] * p._zones)
+    assert len(p._controller.calls) == 2
+    assert p._controller.calls[1][1] == [(10, 11, 12)] * p._zones
+
+
+def test_reconnect_does_not_churn_ambient_capture(main_module):
     p = _plugin(main_module, "ambient", hw=False, per_zone=True)
     p._ambilight.events.clear()
     ok = asyncio.run(p.reconnect())
     assert ok is True
-    assert [event[0] for event in p._ambilight.events] == ["stop_and_wait", "start"]
+    assert [event[0] for event in p._ambilight.events] == ["start"]
 
 
 def test_prepare_suspend_stops_capture_without_changing_user_intent(main_module):

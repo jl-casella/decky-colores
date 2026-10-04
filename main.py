@@ -272,7 +272,7 @@ class Plugin:
         self._engine = EffectEngine(self._render, self._zones, max_fps=max_render_fps)
         runtime_dir, uid, gid = _user_creds()
         self._ambilight = Ambilight(
-            self._render,
+            self._render_ambient,
             self._zones,
             runtime_dir,
             uid,
@@ -280,7 +280,9 @@ class Plugin:
             layout=self._capabilities.get("layout"),
             max_fps=max_render_fps,
         )
-        self._audio = AudioReactive(self._render, self._zones, runtime_dir, uid, gid)
+        self._audio = AudioReactive(
+            self._render_vu, self._zones, runtime_dir, uid, gid
+        )
 
     def _reprobe_device(self) -> bool:
         if self._controller.available:
@@ -514,7 +516,7 @@ class Plugin:
     def _diagnostics_home() -> str:
         return getattr(decky, "DECKY_USER_HOME", None) or os.path.expanduser("~")
 
-    def _run_capture(self, cmd) -> str | None:
+    def _run_capture(self, cmd) -> dict:
         try:
             import subprocess
 
@@ -524,9 +526,29 @@ class Plugin:
             r = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=5, env=env,
             )  # noqa: S603
-            return r.stdout or ""
-        except Exception:  # noqa: BLE001
-            return None
+            return {
+                "stdout": r.stdout or "",
+                "stderr": r.stderr or "",
+                "returncode": r.returncode,
+                "error": None,
+            }
+        except Exception as error:  # noqa: BLE001
+            import subprocess
+
+            if isinstance(error, subprocess.TimeoutExpired):
+                kind = "timeout"
+            elif isinstance(error, FileNotFoundError):
+                kind = "command_not_found"
+            elif isinstance(error, PermissionError):
+                kind = "permission_denied"
+            else:
+                kind = type(error).__name__
+            return {
+                "stdout": "",
+                "stderr": "",
+                "returncode": None,
+                "error": kind,
+            }
 
     def _serialized_saved(self) -> list:
         return [_saved(g) for g in self._settings["saved_gradients"]]
@@ -921,9 +943,6 @@ class Plugin:
         if hasattr(self, "_profiles"):
             self._sync_effective_profile()
         self._apply_sleep_charging_indicator()
-        if self._settings["mode"] == "ambient":
-            await self._ambilight.stop_and_wait()
-            self._capture_owner = None
         self._apply()
         return bool(ok)
 
@@ -941,8 +960,15 @@ class Plugin:
             self._resume_handled_at = None
             mode = self._settings["mode"]
             if mode == "ambient":
+                self._capture_owner = None
                 await self._ambilight.stop_and_wait()
                 decky.logger.info("Colores: ambilight capture stopped for suspend")
+                return
+            if mode == "vu" and self._ambilight.running:
+                # A warm video stream is useful only while awake; VU remains the
+                # RGB owner, and Ambient can reconnect on demand after resume.
+                await self._ambilight.stop_and_wait()
+                decky.logger.info("Colores: warm ambilight capture stopped for suspend")
                 return
             if mode != "vu" and self._wants_render_loop():
                 await self._engine.stop_and_wait()
@@ -1089,6 +1115,24 @@ class Plugin:
             zone_colors, self._settings["brightness"], self._effective_power()
         )
 
+    def _render_ambient(self, zone_colors) -> None:
+        if (
+            getattr(self, "_capture_owner", None) != "ambient"
+            or self._settings.get("mode") != "ambient"
+            or not self._effective_power()
+        ):
+            return
+        self._render(zone_colors)
+
+    def _render_vu(self, zone_colors) -> None:
+        if (
+            getattr(self, "_capture_owner", None) != "vu"
+            or self._settings.get("mode") != "vu"
+            or not self._effective_power()
+        ):
+            return
+        self._render(zone_colors)
+
     def _save_and_apply(self) -> None:
         self._persist_settings()
         self._apply()
@@ -1218,21 +1262,35 @@ class Plugin:
 
     def _schedule_capture_transition(self) -> None:
         """Serialize capture-mode handoffs before any new effect can write RGB."""
+        mode = self._settings["mode"]
+        task = self._capture_transition_task
+        if (
+            mode in ("ambient", "vu")
+            and (task is None or task.done())
+            and self._capture_owner == mode
+            and (self._ambilight.running if mode == "ambient" else self._audio.running)
+        ):
+            # Profile refreshes and repeated UI selections should update options,
+            # not tear down/recreate the Gamescope PipeWire video stream.
+            if mode == "ambient":
+                self._start_capture_mode(mode)
+            decky.logger.info(
+                "Colores: RGB mode unchanged owner=%s; capture retained", mode
+            )
+            return
+
         self._capture_transition_generation += 1
         generation = self._capture_transition_generation
-        mode = self._settings["mode"]
         decky.logger.info(
             "Colores: RGB mode transition requested owner=%s target=%s generation=%s",
             self._capture_owner,
             mode,
             generation,
         )
-        task = self._capture_transition_task
         if (
             mode in ("ambient", "vu")
             and (task is None or task.done())
             and getattr(self, "_capture_owner", None) is None
-            and not self._ambilight.running
             and not self._audio.running
             and not self._engine.running
         ):
@@ -1267,6 +1325,9 @@ class Plugin:
                 }
             )
         elif mode == "vu":
+            # Keep an existing video capture connection warm, but never let its
+            # frames write RGB while VU owns the LEDs.
+            self._ambilight.set_active(False)
             self._audio.start()
 
     async def _run_capture_transition_queue(self) -> None:
@@ -1281,12 +1342,13 @@ class Plugin:
                 target,
                 generation,
             )
-            # Stop and join every producer before starting another. The task
-            # finally blocks reap capture processes and cancel frame readers.
-            await self._ambilight.stop_and_wait()
+            # Gate stale callbacks immediately. Keep an established Ambilight
+            # PipeWire stream connected across VU so quick mode changes do not
+            # repeatedly destroy/recreate Gamescope's video buffers.
+            self._capture_owner = None
+            self._ambilight.set_active(False)
             await self._audio.stop_and_wait()
             await self._engine.stop_and_wait()
-            self._capture_owner = None
 
             if generation != self._capture_transition_generation:
                 decky.logger.info(
@@ -1297,8 +1359,19 @@ class Plugin:
                 continue
 
             if target is not None:
+                self._capture_owner = target
                 self._start_capture_mode(target)
             else:
+                # Leaving both capture modes is the point where the retained
+                # video stream is no longer useful; release it exactly once.
+                await self._ambilight.stop_and_wait()
+                if generation != self._capture_transition_generation:
+                    decky.logger.info(
+                        "Colores: RGB transition superseded after capture release generation=%s latest=%s",
+                        generation,
+                        self._capture_transition_generation,
+                    )
+                    continue
                 # Clear the coordinator before applying the requested non-
                 # capture mode so _apply can safely select its normal backend.
                 self._capture_transition_task = None
