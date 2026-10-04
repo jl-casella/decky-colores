@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from pathlib import Path
 import select
 import subprocess
@@ -20,17 +21,25 @@ class ReleaseIntegrationTests(unittest.TestCase):
     def _read_until(self, process, predicate, timeout=12):
         deadline = time.monotonic() + timeout
         messages = []
+        buffer = getattr(process, "_colores_output_buffer", "")
+        stdout_fd = process.stdout.fileno()
         while time.monotonic() < deadline:
-            ready, _, _ = select.select([process.stdout], [], [], 0.25)
-            if not ready:
+            if "\n" not in buffer:
+                ready, _, _ = select.select([stdout_fd], [], [], 0.25)
+                if not ready:
+                    continue
+                chunk = os.read(stdout_fd, 4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8")
                 continue
-            line = process.stdout.readline()
-            if not line:
-                break
+            line, buffer = buffer.split("\n", 1)
+            process._colores_output_buffer = buffer
             message = json.loads(line)
             messages.append(message)
             if predicate(message):
                 return message, messages
+        process._colores_output_buffer = buffer
         stderr = process.stderr.read(4000) if process.poll() is not None else ""
         self.fail(f"worker event timed out; messages={messages!r}; stderr={stderr}")
 
@@ -332,6 +341,73 @@ class ReleaseIntegrationTests(unittest.TestCase):
                 process.stdin.close()
                 process.stdout.close()
                 process.stderr.close()
+
+    def test_switching_from_vu_to_ambilight_activates_virtual_rendering(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with zipfile.ZipFile(RELEASE) as archive:
+                archive.extractall(root)
+            settings_dir = root / "settings"
+            settings_dir.mkdir()
+            (settings_dir / "state.json").write_text(json.dumps({
+                "enabled_experiments": ["brightness"]
+            }))
+            restore_config = {
+                "profile": {
+                    "brightness": 100,
+                    "mode": "vu",
+                    "ambilight": {
+                        "vividness": 27,
+                        "smoothing": 0,
+                        "fps": 30,
+                        "sampling": "columns",
+                    },
+                },
+                "power": True,
+            }
+            process, _ = self._launch_worker(
+                root / "Colores", settings_dir, "AYN Odin 2", restore_config,
+            )
+            try:
+                process.stdin.write(json.dumps({
+                    "id": 1,
+                    "type": "rpc",
+                    "name": "set_experiment",
+                    "args": ["ambilight", True],
+                }) + "\n")
+                process.stdin.flush()
+                experiment_response, _ = self._read_until(
+                    process, lambda message: message.get("id") == 1,
+                )
+                self.assertTrue(experiment_response["ok"], experiment_response)
+
+                process.stdin.write(json.dumps({
+                    "id": 2,
+                    "type": "rpc",
+                    "name": "set_mode",
+                    "args": ["ambient"],
+                }) + "\n")
+                process.stdin.flush()
+                response, _ = self._read_until(process, lambda message: message.get("id") == 2)
+                self.assertTrue(response["ok"], response)
+
+                frame = base64.b64encode(bytes([0, 255, 0]) * (64 * 36)).decode("ascii")
+                process.stdin.write(json.dumps({
+                    "type": "video_frame",
+                    "data": frame,
+                    "width": 64,
+                    "height": 36,
+                }) + "\n")
+                process.stdin.flush()
+                led_state, _ = self._read_until(
+                    process,
+                    lambda message: message.get("type") == "led_state"
+                    and any(any(channel for channel in color) for color in message.get("colors", [])),
+                )
+                self.assertEqual(len(led_state["colors"]), 4)
+                self.assertTrue(any(color[1] > 0 for color in led_state["colors"]))
+            finally:
+                self._stop_worker(process)
 
 
 if __name__ == "__main__":
