@@ -403,7 +403,9 @@ def build_device(sysfs_root="/", ambilight=False):
     armada_match = build_armada_device(info.get("model"), leds_dir, sysfs_root)
     if armada_match is not None:
         armada_profile, device = armada_match
-        if device.available:
+        # A docking controller (gcmhid) may be off or detached at startup:
+        # keep it, writes fail until it is back.
+        if device.available or armada_profile["backend"]["type"] == "gcmhid":
             zones = device.zone_count
             profile.update({
                 "name": info["model"],
