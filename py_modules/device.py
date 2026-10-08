@@ -83,9 +83,13 @@ def detect_device(sysfs_root="/", machine=None):
     board = _read(os.path.join(dmi, "board_name"))
     product = _read(os.path.join(dmi, "product_name"))
     vendor = _read(os.path.join(dmi, "sys_vendor"))
-    model = product or _read(os.path.join(sysfs_root, "sys/firmware/devicetree/base/model"))
+    # On ARM the device tree names the device; UEFI firmware there can carry
+    # placeholder DMI (Qualcomm boards report "QRD"), so prefer the tree.
+    model = _read(os.path.join(sysfs_root, "sys/firmware/devicetree/base/model"))
     if not model:
         model = _read(os.path.join(sysfs_root, "proc/device-tree/model"))
+    if not model:
+        model = product
     name = lookup_name(board, product) if product or board else model or "Unknown device"
     display_name_key = None
     if name == "Unknown device" and (
