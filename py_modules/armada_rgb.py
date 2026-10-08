@@ -56,6 +56,30 @@ def _validate_correction(value):
     return dict(value)
 
 
+_HEX_ID = re.compile(r"^[0-9a-fA-F]{4}$")
+
+
+def _validate_gcmhid(backend):
+    _exact_keys(backend, {"type", "vendor", "product", "strips"}, "gcmhid backend")
+    for key in ("vendor", "product"):
+        if not isinstance(backend[key], str) or not _HEX_ID.fullmatch(backend[key]):
+            raise ArmadaProfileError(f"invalid gcmhid {key}")
+    strips = backend["strips"]
+    if (
+        not isinstance(strips, list)
+        or not strips
+        or any(isinstance(s, bool) or not isinstance(s, int) or not 0 < s < 255 for s in strips)
+        or len(strips) != len(set(strips))
+    ):
+        raise ArmadaProfileError("invalid gcmhid strips")
+    return {
+        "type": "gcmhid",
+        "vendor": backend["vendor"].lower(),
+        "product": backend["product"].lower(),
+        "strips": list(strips),
+    }
+
+
 def validate_catalog(raw):
     _exact_keys(raw, {"version", "profiles"}, "catalog")
     if (
@@ -85,11 +109,22 @@ def validate_catalog(raw):
             seen_models.add(model)
 
         backend = raw_profile["backend"]
-        _exact_keys(backend, {"type", "targets"}, "backend")
+        if not isinstance(backend, dict) or not isinstance(backend.get("type"), str):
+            raise ArmadaProfileError("invalid backend fields")
         backend_type = backend["type"]
-        targets = backend["targets"]
+        if backend_type == "gcmhid":
+            profile = {"models": list(models), "backend": _validate_gcmhid(backend)}
+            if "correction" in raw_profile:
+                profile["correction"] = _validate_correction(raw_profile["correction"])
+            profiles.append(profile)
+            continue
         if backend_type not in {"multicolor", "channels"}:
-            raise ArmadaProfileError("unsupported backend type")
+            # armada-rgb grows backends Colores does not drive (e.g. serial):
+            # skip those devices instead of dropping the whole system catalog.
+            logger.info("Skipping Armada RGB profile %s: unsupported backend %r", models, backend_type)
+            continue
+        _exact_keys(backend, {"type", "targets"}, "backend")
+        targets = backend["targets"]
         if not isinstance(targets, list) or not targets:
             raise ArmadaProfileError("RGB target list is empty")
 
@@ -392,10 +427,186 @@ class ArmadaRgbDevice(LedDevice):
         return self.apply_zones([tuple(color)] * self._zones, brightness, power)
 
 
+# GameSir "GCM" lighting over a controller's vendor HID interface: the Lenovo
+# Legion G9 that docks to the Legion Tab Gen 3 (TB321FU). Each strip takes
+# 05 0C 0C 01 <strip> H S B <effect> <speed> <brightness> plus a byte sum, as a
+# report-ID-less output report; colors are HSB (hue scaled to a byte,
+# saturation/brightness in percent). Effects: 1 solid, 2 breathing,
+# 4 rainbow, 0xFF off. The controller animates the effects itself.
+_GCM_SOLID = 0x01
+_GCM_BREATHING = 0x02
+_GCM_RAINBOW = 0x04
+_GCM_OFF = 0xFF
+_GCM_DESCRIPTOR_PREFIX = b"\x06\x7a\xff"  # usage page 0xFF7A
+_GCM_EFFECTS = {
+    "breathing": _GCM_BREATHING,
+    "rainbow": _GCM_RAINBOW,
+    "cycle": _GCM_RAINBOW,
+    "spiral": _GCM_RAINBOW,
+}
+
+
+def _gcm_hsb(color):
+    r, g, b = (max(0, min(255, int(c))) for c in color)
+    high, low = max(r, g, b), min(r, g, b)
+    delta = high - low
+    if delta == 0:
+        hue = 0.0
+    elif high == r:
+        hue = 60.0 * (((g - b) / delta) % 6)
+    elif high == g:
+        hue = 60.0 * ((b - r) / delta + 2)
+    else:
+        hue = 60.0 * ((r - g) / delta + 4)
+    saturation = 0 if high == 0 else round(delta / high * 100)
+    return [round(hue / 360 * 255) % 256, saturation, round(high / 255 * 100)]
+
+
+def _gcm_byte(percent):
+    return (max(0, min(100, int(percent))) * 255 + 50) // 100
+
+
+def gcm_strip_packet(strip, hsb, effect, speed=0x80, brightness=0xFF):
+    payload = [0x05, 0x0C, 0x0C, 0x01, strip, *hsb, effect, speed, brightness]
+    return bytes([0x00, *payload, sum(payload) & 0xFF])
+
+
+class GcmHidRgbDevice(LedDevice):
+    """Legion G9 light strips through armada-rgb's gcmhid catalog entry."""
+
+    def __init__(self, backend, sysfs_root="/", correction=None):
+        self._root = sysfs_root
+        self._hid_id = "HID_ID=0003:0000{}:0000{}".format(
+            backend["vendor"].upper(), backend["product"].upper()
+        )
+        self._strips = list(backend["strips"])
+        self._zones = len(self._strips)
+        self._correction = correction
+        self._max_brightness = 100
+        self.last_error = None
+        self._write_lock = _ARMADA_WRITE_LOCK
+        # Kept open between frames: reopening wakes the USB interface and costs
+        # far more than the write itself (8 ms per report on the G9).
+        self._fd = None
+
+    def _find(self):
+        hidraw = os.path.join(self._root, "sys/class/hidraw")
+        try:
+            names = sorted(n for n in os.listdir(hidraw) if n.startswith("hidraw"))
+        except OSError:
+            return None
+        for name in names:
+            device = os.path.join(hidraw, name, "device")
+            try:
+                with open(os.path.join(device, "uevent"), encoding="ascii", errors="replace") as handle:
+                    if self._hid_id.upper() not in (line.strip().upper() for line in handle):
+                        continue
+                with open(os.path.join(device, "report_descriptor"), "rb") as handle:
+                    if not handle.read(3).startswith(_GCM_DESCRIPTOR_PREFIX):
+                        continue
+            except OSError:
+                continue
+            return os.path.join(self._root, "dev", name)
+        return None
+
+    @property
+    def available(self):
+        return self._find() is not None
+
+    @property
+    def led_path(self):
+        return self._find()
+
+    @property
+    def zone_count(self):
+        return self._zones
+
+    def supports_per_zone(self):
+        return self._zones > 1
+
+    def supports_hardware_effects(self):
+        return True
+
+    def reconnect(self):
+        return self.available
+
+    def _close(self):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def _write_all(self, packets):
+        if self._fd is None:
+            path = self._find()
+            if path is None:
+                raise FileNotFoundError("controller not connected")
+            self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0))
+        for packet in packets:
+            os.write(self._fd, packet)
+
+    def _send(self, packets):
+        with self._write_lock:
+            try:
+                self._write_all(packets)
+            except OSError:
+                # Detached, powered off or re-enumerated: find it again once.
+                self._close()
+                try:
+                    self._write_all(packets)
+                except FileNotFoundError as error:
+                    self.last_error = str(error)
+                    return False
+                except OSError as error:
+                    self._close()
+                    self.last_error = str(error)
+                    return False
+        self.last_error = None
+        return True
+
+    def invalidate(self):
+        with self._write_lock:
+            self._close()
+
+    def _off(self):
+        return self._send([gcm_strip_packet(s, [0, 0, 0], _GCM_OFF) for s in self._strips])
+
+    def apply_zones(self, zone_colors, brightness, power):
+        if not power:
+            return self._off()
+        packets = []
+        for strip, color in zip(self._strips, self._fit(zone_colors)):
+            hue, saturation, value = _gcm_hsb(_correct(color, self._correction))
+            value = _scale(brightness, value)
+            packets.append(gcm_strip_packet(strip, [hue, saturation, value], _GCM_SOLID))
+        return self._send(packets)
+
+    def apply_solid(self, color, brightness, power):
+        return self.apply_zones([tuple(color)] * self._zones, brightness, power)
+
+    def apply_hardware_effect(self, effect_id, color, speed, brightness, power):
+        effect = _GCM_EFFECTS.get(effect_id)
+        if not power:
+            return self._off()
+        if effect is None:
+            return self.apply_solid(color, brightness, power)
+        hue, saturation, value = _gcm_hsb(_correct(color, self._correction))
+        hsb = [hue, saturation, _scale(brightness, value)]
+        return self._send([
+            gcm_strip_packet(s, hsb, effect, _gcm_byte(speed), _gcm_byte(brightness))
+            for s in self._strips
+        ])
+
+
 def build_armada_device(model, leds_dir, sysfs_root="/"):
     profile = profile_for_model(model, sysfs_root)
     if profile is None:
         return None
+    if profile["backend"]["type"] == "gcmhid":
+        device = GcmHidRgbDevice(profile["backend"], sysfs_root, profile.get("correction"))
+        return profile, device
     device = ArmadaRgbDevice(
         leds_dir,
         profile["backend"],
@@ -418,6 +629,7 @@ def layout_for_profile(model, profile, zones):
         "Retroid Pocket 6 TOP-DPAD",
         "Retroid Pocket Nova",
         "AYN Odin 3",
+        "Lenovo Legion Y700 (2025) / TB321FU",
     }
     if model in side_models and zones > 1 and zones % 2 == 0:
         half = zones // 2

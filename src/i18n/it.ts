@@ -16,6 +16,7 @@ export const it: Record<string, string> = {
   "device.armadaOs": "Dispositivo Armada OS",
   "device.preview.rings": "Anelli degli stick",
   "device.preview.bar": "Barra luminosa",
+  "device.preview.strips": "Strisce luminose",
   "device.preview.off": "Spento",
   "device.preview.ambient": "Segue lo schermo",
 

@@ -685,3 +685,27 @@ def test_build_device_oxp_without_node_degrades(tmp_path):
     ctx = build_device(root)
     assert ctx["capabilities"]["color"] is False
     assert type(ctx["device"]).__name__ == "NullDevice"
+
+
+def test_device_tree_model_wins_over_placeholder_dmi(tmp_path):
+    dmi = tmp_path / "sys/class/dmi/id"
+    dmi.mkdir(parents=True)
+    (dmi / "product_name").write_text("QRD\n")
+    (dmi / "board_name").write_text("QRD\n")
+    model = tmp_path / "sys/firmware/devicetree/base/model"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"Lenovo Legion Y700 (2025) / TB321FU\x00")
+
+    info = detect_device(str(tmp_path), machine="aarch64")
+
+    assert info["model"] == "Lenovo Legion Y700 (2025) / TB321FU"
+
+
+def test_legion_g9_strips_replace_the_stick_rings(tmp_path):
+    root = str(tmp_path)
+    _make_model(root, "Lenovo Legion Y700 (2025) / TB321FU")
+
+    ctx = build_device(root)
+
+    assert ctx["capabilities"]["layoutKind"] == "strips"
+    assert [group["kind"] for group in ctx["capabilities"]["layout"]] == ["shared-edge", "shared-edge"]

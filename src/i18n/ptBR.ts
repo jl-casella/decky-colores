@@ -16,6 +16,7 @@ export const ptBR: Record<string, string> = {
   "device.armadaOs": "Dispositivo Armada OS",
   "device.preview.rings": "Anéis dos joysticks",
   "device.preview.bar": "Barra de luz",
+  "device.preview.strips": "Faixas de luz",
   "device.preview.off": "Desligado",
   "device.preview.ambient": "Seguindo a tela",
 

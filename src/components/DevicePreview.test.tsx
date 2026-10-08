@@ -22,6 +22,22 @@ describe("DevicePreview capability layouts", () => {
     expect(html).not.toContain("device.preview.rings");
   });
 
+  it("draws side light strips instead of stick rings", () => {
+    const html = renderToStaticMarkup(createElement(DevicePreview, {
+      colors: [
+        { r: 255, g: 0, b: 0 },
+        { r: 0, g: 0, b: 255 },
+      ],
+      brightness: 100,
+      power: true,
+      layoutKind: "strips",
+    }));
+
+    expect(html).toContain("device.preview.strips");
+    expect(html).not.toContain("device.preview.rings");
+    expect(html.match(/stroke-linejoin="round"/g)).toHaveLength(6);
+  });
+
   it("keeps powered rings visible at low LED brightness", () => {
     const html = renderToStaticMarkup(createElement(DevicePreview, {
       colors: [

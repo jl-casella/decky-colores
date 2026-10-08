@@ -83,9 +83,13 @@ def detect_device(sysfs_root="/", machine=None):
     board = _read(os.path.join(dmi, "board_name"))
     product = _read(os.path.join(dmi, "product_name"))
     vendor = _read(os.path.join(dmi, "sys_vendor"))
-    model = product or _read(os.path.join(sysfs_root, "sys/firmware/devicetree/base/model"))
+    # On ARM the device tree names the device; UEFI firmware there can carry
+    # placeholder DMI (Qualcomm boards report "QRD"), so prefer the tree.
+    model = _read(os.path.join(sysfs_root, "sys/firmware/devicetree/base/model"))
     if not model:
         model = _read(os.path.join(sysfs_root, "proc/device-tree/model"))
+    if not model:
+        model = product
     name = lookup_name(board, product) if product or board else model or "Unknown device"
     display_name_key = None
     if name == "Unknown device" and (
@@ -403,7 +407,9 @@ def build_device(sysfs_root="/", ambilight=False):
     armada_match = build_armada_device(info.get("model"), leds_dir, sysfs_root)
     if armada_match is not None:
         armada_profile, device = armada_match
-        if device.available:
+        # A docking controller (gcmhid) may be off or detached at startup:
+        # keep it, writes fail until it is back.
+        if device.available or armada_profile["backend"]["type"] == "gcmhid":
             zones = device.zone_count
             profile.update({
                 "name": info["model"],
@@ -420,6 +426,9 @@ def build_device(sysfs_root="/", ambilight=False):
                 power_led, battery, temperature,
             )
             capabilities["perZone"] = device.supports_per_zone()
+            if armada_profile["backend"]["type"] == "gcmhid":
+                # The G9's lights are strips down each grip, not stick rings.
+                capabilities["layoutKind"] = "strips"
             capabilities["layout"] = layout_for_profile(
                 info["model"], armada_profile, zones
             )

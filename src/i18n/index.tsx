@@ -37,6 +37,7 @@ const es: Record<string, string> = {
   "device.armadaOs": "Dispositivo Armada OS",
   "device.preview.rings": "Anillos del joystick",
   "device.preview.bar": "Barra de luz",
+  "device.preview.strips": "Tiras de luz",
   "device.preview.off": "Apagado",
   "device.preview.ambient": "Siguiendo la pantalla",
 
@@ -261,6 +262,7 @@ const en: Record<string, string> = {
   "device.armadaOs": "Armada OS Device",
   "device.preview.rings": "Joystick rings",
   "device.preview.bar": "Light bar",
+  "device.preview.strips": "Light strips",
   "device.preview.off": "Off",
   "device.preview.ambient": "Reacting to screen",
 
