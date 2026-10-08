@@ -11,7 +11,6 @@ import math
 import os
 import re
 import threading
-import time
 
 from led_device import LedDevice
 
@@ -486,6 +485,9 @@ class GcmHidRgbDevice(LedDevice):
         self._max_brightness = 100
         self.last_error = None
         self._write_lock = _ARMADA_WRITE_LOCK
+        # Kept open between frames: reopening wakes the USB interface and costs
+        # far more than the write itself (8 ms per report on the G9).
+        self._fd = None
 
     def _find(self):
         hidraw = os.path.join(self._root, "sys/class/hidraw")
@@ -528,29 +530,45 @@ class GcmHidRgbDevice(LedDevice):
     def reconnect(self):
         return self.available
 
+    def _close(self):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def _write_all(self, packets):
+        if self._fd is None:
+            path = self._find()
+            if path is None:
+                raise FileNotFoundError("controller not connected")
+            self._fd = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_CLOEXEC", 0))
+        for packet in packets:
+            os.write(self._fd, packet)
+
     def _send(self, packets):
-        path = self._find()
-        if path is None:
-            self.last_error = "controller not connected"
-            return False
         with self._write_lock:
             try:
-                handle = os.open(path, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
-            except OSError as error:
-                self.last_error = str(error)
-                return False
-            try:
-                for index, packet in enumerate(packets):
-                    if index:
-                        time.sleep(0.01)
-                    os.write(handle, packet)
-            except OSError as error:
-                self.last_error = str(error)
-                return False
-            finally:
-                os.close(handle)
+                self._write_all(packets)
+            except OSError:
+                # Detached, powered off or re-enumerated: find it again once.
+                self._close()
+                try:
+                    self._write_all(packets)
+                except FileNotFoundError as error:
+                    self.last_error = str(error)
+                    return False
+                except OSError as error:
+                    self._close()
+                    self.last_error = str(error)
+                    return False
         self.last_error = None
         return True
+
+    def invalidate(self):
+        with self._write_lock:
+            self._close()
 
     def _off(self):
         return self._send([gcm_strip_packet(s, [0, 0, 0], _GCM_OFF) for s in self._strips])
