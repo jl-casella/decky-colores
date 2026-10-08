@@ -426,6 +426,9 @@ def build_device(sysfs_root="/", ambilight=False):
                 power_led, battery, temperature,
             )
             capabilities["perZone"] = device.supports_per_zone()
+            if armada_profile["backend"]["type"] == "gcmhid":
+                # The G9's lights are strips down each grip, not stick rings.
+                capabilities["layoutKind"] = "strips"
             capabilities["layout"] = layout_for_profile(
                 info["model"], armada_profile, zones
             )

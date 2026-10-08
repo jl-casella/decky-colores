@@ -699,3 +699,13 @@ def test_device_tree_model_wins_over_placeholder_dmi(tmp_path):
     info = detect_device(str(tmp_path), machine="aarch64")
 
     assert info["model"] == "Lenovo Legion Y700 (2025) / TB321FU"
+
+
+def test_legion_g9_strips_replace_the_stick_rings(tmp_path):
+    root = str(tmp_path)
+    _make_model(root, "Lenovo Legion Y700 (2025) / TB321FU")
+
+    ctx = build_device(root)
+
+    assert ctx["capabilities"]["layoutKind"] == "strips"
+    assert [group["kind"] for group in ctx["capabilities"]["layout"]] == ["shared-edge", "shared-edge"]

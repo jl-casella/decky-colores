@@ -629,6 +629,7 @@ def layout_for_profile(model, profile, zones):
         "Retroid Pocket 6 TOP-DPAD",
         "Retroid Pocket Nova",
         "AYN Odin 3",
+        "Lenovo Legion Y700 (2025) / TB321FU",
     }
     if model in side_models and zones > 1 and zones % 2 == 0:
         half = zones // 2

@@ -138,6 +138,32 @@ const Uniform: FC<{ color: RGB; intensity: number }> = ({ color, intensity }) =>
   );
 };
 
+// The Legion G9's strips: down the outer edge of each grip, then bending
+// inward toward the bottom.
+const STRIP_PATHS = ["M 54 14 L 63 58 L 90 88", "M 246 14 L 237 58 L 210 88"];
+
+const Strips: FC<{ colors: RGB[][]; intensity: number }> = ({ colors, intensity }) => (
+  <svg viewBox="0 0 300 100" style={{ display: "block", width: "100%", maxWidth: 300, margin: "0 auto", overflow: "visible" }}>
+    <defs>
+      <filter id="colores-strip-glow" x="-100%" y="-50%" width="300%" height="200%">
+        <feGaussianBlur stdDeviation={3 + intensity * 4} />
+      </filter>
+    </defs>
+    {STRIP_PATHS.map((d, i) => {
+      const glow = rgbToCss(average(colors[i]));
+      const line = { d, fill: "none", strokeLinecap: "round", strokeLinejoin: "round" } as const;
+      const fade = { opacity: 0.45 + intensity * 0.55, transition: "opacity 140ms ease, stroke 140ms ease" };
+      return (
+        <g key={i}>
+          <path {...line} stroke="#0c0c10" strokeWidth={13} />
+          <path {...line} stroke={glow} strokeWidth={10} filter="url(#colores-strip-glow)" style={fade} />
+          <path {...line} stroke={glow} strokeWidth={8} style={fade} />
+        </g>
+      );
+    })}
+  </svg>
+);
+
 export const DevicePreview: FC<DevicePreviewProps> = ({ colors, brightness, power, label, layoutKind, segments }) => {
   const { t } = useI18n();
   const source = power && colors.length ? colors : [OFF];
@@ -166,6 +192,14 @@ export const DevicePreview: FC<DevicePreviewProps> = ({ colors, brightness, powe
   const half = lit.length > 1 ? Math.ceil(lit.length / 2) : lit.length;
   const leftColors = lit.length > 1 ? lit.slice(0, half) : lit;
   const rightColors = lit.length > 1 ? lit.slice(half) : lit;
+
+  if (layoutKind === "strips") {
+    return (
+      <PreviewFrame caption={caption("device.preview.strips")}>
+        <Strips colors={[leftColors, rightColors]} intensity={intensity} />
+      </PreviewFrame>
+    );
+  }
 
   return (
     <PreviewFrame caption={caption("device.preview.rings")}>
