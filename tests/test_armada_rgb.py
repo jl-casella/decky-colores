@@ -8,6 +8,9 @@ import armada_rgb
 from armada_rgb import (
     ArmadaProfileError,
     ArmadaRgbDevice,
+    GcmHidRgbDevice,
+    build_armada_device,
+    gcm_strip_packet,
     catalog_for_root,
     layout_for_profile,
     profile_for_model,
@@ -50,6 +53,7 @@ def test_bundled_catalog_covers_all_current_armada_models():
         "KONKR Pocket FIT Elite",
         "MANGMI Air Y Pro",
         "MANGMI Pocket Max",
+        "Lenovo Legion Y700 (2025) / TB321FU",
     }
     catalog = catalog_for_root("/path/that/does/not/exist")
     actual = {model for profile in catalog["profiles"] for model in profile["models"]}
@@ -271,3 +275,102 @@ def test_unknown_geometry_uses_safe_global_ambilight_layout():
         "zones": list(range(16)),
         "kind": "shared-full",
     }]
+
+
+def test_unsupported_backend_skips_only_that_profile(tmp_path):
+    path = tmp_path / "usr/share/armada-rgb/profiles.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "version": 1,
+        "profiles": [
+            {"models": ["Serial Handheld"], "backend": {"type": "serial", "device": "ttyHS2"}},
+            {"models": ["Future Handheld"], "backend": {"type": "multicolor", "targets": ["future:rgb"]}},
+        ],
+    }))
+
+    assert profile_for_model("Serial Handheld", str(tmp_path)) is None
+    assert profile_for_model("Future Handheld", str(tmp_path))["models"] == ["Future Handheld"]
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        {"type": "gcmhid", "vendor": "3537", "product": "1134"},
+        {"type": "gcmhid", "vendor": "35x7", "product": "1134", "strips": [1]},
+        {"type": "gcmhid", "vendor": "3537", "product": "1134", "strips": []},
+        {"type": "gcmhid", "vendor": "3537", "product": "1134", "strips": [1, 1]},
+        {"type": "gcmhid", "vendor": "3537", "product": "1134", "strips": [255]},
+    ],
+)
+def test_gcmhid_backend_validation(backend):
+    with pytest.raises(ArmadaProfileError):
+        validate_catalog({"version": 1, "profiles": [{"models": ["G9"], "backend": backend}]})
+
+
+def _gcm_sysfs(tmp_path, name="hidraw1", hid_id="HID_ID=0003:00003537:00001134", descriptor=b"\x06\x7a\xff\x09\x01"):
+    device = tmp_path / "sys/class/hidraw" / name / "device"
+    device.mkdir(parents=True)
+    (device / "uevent").write_text(f"DRIVER=hid-generic\n{hid_id}\nHID_NAME=Legion Gaming Controller G9\n")
+    (device / "report_descriptor").write_bytes(descriptor)
+    node = tmp_path / "dev" / name
+    node.parent.mkdir(exist_ok=True)
+    node.write_bytes(b"")
+    return node
+
+
+_G9 = {"type": "gcmhid", "vendor": "3537", "product": "1134", "strips": [1, 2]}
+
+
+def test_gcm_packet_matches_the_controller_protocol():
+    # Left strip red, solid: the packet read back from a G9.
+    assert gcm_strip_packet(1, [0, 100, 100], 0x01) == bytes(
+        [0x00, 0x05, 0x0C, 0x0C, 0x01, 0x01, 0x00, 0x64, 0x64, 0x01, 0x80, 0xFF, 0x67]
+    )
+
+
+def test_gcmhid_finds_the_vendor_interface_and_writes_each_strip(tmp_path):
+    _gcm_sysfs(tmp_path, "hidraw0", descriptor=b"\x05\x01\x09\x05")  # gamepad interface
+    node = _gcm_sysfs(tmp_path, "hidraw1")
+    device = GcmHidRgbDevice(_G9, str(tmp_path))
+
+    assert device.available and device.zone_count == 2 and device.supports_per_zone()
+    assert device.apply_zones([(255, 0, 0), (0, 0, 255)], 100, True)
+    data = node.read_bytes()
+    assert data[:13] == gcm_strip_packet(1, [0, 100, 100], 0x01)
+    assert data[13:] == gcm_strip_packet(2, [170, 100, 100], 0x01)
+
+
+def test_gcmhid_brightness_off_and_effects(tmp_path):
+    node = _gcm_sysfs(tmp_path)
+    device = GcmHidRgbDevice(_G9, str(tmp_path))
+
+    device.apply_solid((0, 255, 0), 50, True)
+    assert node.read_bytes()[:13] == gcm_strip_packet(1, [85, 100, 50], 0x01)
+    node.write_bytes(b"")
+    device.apply_solid((0, 255, 0), 50, False)
+    assert node.read_bytes()[:13] == gcm_strip_packet(1, [0, 0, 0], 0xFF)
+    node.write_bytes(b"")
+    device.apply_hardware_effect("breathing", (255, 0, 0), 100, 100, True)
+    assert node.read_bytes()[:13] == gcm_strip_packet(1, [0, 100, 100], 0x02, 0xFF, 0xFF)
+    node.write_bytes(b"")
+    device.apply_hardware_effect("rainbow", (255, 0, 0), 0, 50, True)
+    assert node.read_bytes()[:13] == gcm_strip_packet(1, [0, 100, 50], 0x04, 0x00, 0x80)
+
+
+def test_gcmhid_reports_a_missing_controller(tmp_path):
+    _gcm_sysfs(tmp_path, hid_id="HID_ID=0003:0000045E:0000028E")
+    device = GcmHidRgbDevice(_G9, str(tmp_path))
+
+    assert not device.available
+    assert not device.apply_solid((255, 255, 255), 100, True)
+    assert device.last_error == "controller not connected"
+
+
+def test_build_armada_device_returns_gcmhid_device(tmp_path):
+    path = tmp_path / "usr/share/armada-rgb/profiles.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"version": 1, "profiles": [{"models": ["G9 Tablet"], "backend": _G9}]}))
+
+    profile, device = build_armada_device("G9 Tablet", str(tmp_path / "sys/class/leds"), str(tmp_path))
+    assert profile["backend"]["type"] == "gcmhid"
+    assert isinstance(device, GcmHidRgbDevice)
